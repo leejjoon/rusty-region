@@ -1,17 +1,23 @@
 # Cargo.toml
-# Defines the Rust package metadata and dependencies.
 
 [package]
 name = "rusty_region"
 version = "0.1.0"
 edition = "2021"
-description = "A parser for DS9 region files"
+description = "A parser for DS9 region files using nom, with Python bindings"
 license = "MIT" # Or choose another license
 repository = "https://github.com/your_username/rusty_region" # Optional: Add your repo URL
 
+# Add this section for the Python extension module configuration
+[lib]
+name = "rusty_region_parser" # Name of the python module file (e.g., rusty_region_parser.so)
+crate-type = ["cdylib"] # Compile dynamic library for Python
+
 [dependencies]
 nom = "7.1"
+# Add pyo3 dependency with the "extension-module" feature
+pyo3 = { version = "0.21", features = ["extension-module"] }
+
 
 [dev-dependencies]
 # Dependencies needed only for running tests or examples
-

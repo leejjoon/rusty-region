@@ -2,20 +2,27 @@
 //!
 //! A parser for DS9 region files, written in Rust using nom 7.1.
 //! This library provides tools to parse region file strings into structured data.
+//! Includes Python bindings via PyO3.
+
+// --- PyO3 Imports ---
+use pyo3::prelude::*;
+use pyo3::exceptions::PyValueError; // For raising Python errors
+// use pyo3::types::PyList; // Unused
 
 // --- Module Imports ---
 use nom::{
     IResult, // Standard nom result type: Result<(Input, Output), Err<Error>>
-    Err as NomErr, // nom's error type wrapper
-    character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char, space1}, // Character parsers
-    bytes::complete::{tag, take_while1}, // Byte/tag parsers
-    combinator::{map, opt, value}, // Combinators
+    // Err as NomErr, // Unused
+    character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char}, // Removed unused space1
+    bytes::complete::{take_while1}, // Removed unused tag
+    combinator::{map, opt}, // Removed unused value
     sequence::{preceded, terminated, separated_pair, tuple}, // Sequence combinators
     multi::{separated_list0, separated_list1}, // List combinators
     number::complete::double, // Floating point number parser
-    branch::alt, // Alternative parsers (for future use, e.g., property values)
-    error::{ParseError as NomParseError, VerboseError, context}, // Error handling
+    // branch::alt, // Unused
+    error::{VerboseError, context}, // Renamed trait import
     Finish, // Used to convert IResult to standard Result and ensure full consumption
+    // Parser, // Unused
 };
 
 // --- Custom Error Type (Optional but recommended for better errors) ---
@@ -26,6 +33,7 @@ type Error<'a> = VerboseError<&'a str>;
 // --- Data Structures ---
 
 /// Represents the type of a geometric shape found in a region file.
+// Note: This is kept as a Rust enum internally. We'll convert it to a string for Python.
 #[derive(Debug, PartialEq, Clone)]
 pub enum ShapeType {
     Circle,
@@ -37,20 +45,111 @@ pub enum ShapeType {
     Unsupported(String),
 }
 
+impl ShapeType {
+    /// Converts the enum variant to a string representation.
+    fn to_string_py(&self) -> String {
+        match self {
+            ShapeType::Circle => "circle".to_string(),
+            ShapeType::Ellipse => "ellipse".to_string(),
+            ShapeType::Box => "box".to_string(),
+            ShapeType::Polygon => "polygon".to_string(),
+            ShapeType::Point => "point".to_string(),
+            ShapeType::Line => "line".to_string(),
+            ShapeType::Unsupported(s) => format!("unsupported({})", s),
+        }
+    }
+
+    /// Converts a string back to the enum variant (basic implementation).
+    fn from_string_py(s: &str) -> Self {
+        match s {
+            "circle" => ShapeType::Circle,
+            "ellipse" => ShapeType::Ellipse,
+            "box" => ShapeType::Box,
+            "polygon" => ShapeType::Polygon,
+            "point" => ShapeType::Point,
+            "line" => ShapeType::Line,
+            // Basic handling for unsupported, might need refinement
+            _ if s.starts_with("unsupported(") && s.ends_with(')') => {
+                ShapeType::Unsupported(s["unsupported(".len()..s.len()-1].to_string())
+            }
+            _ => ShapeType::Unsupported(s.to_string()), // Default fallback
+        }
+    }
+}
+
+
 /// Represents a key-value property associated with a shape (e.g., color=red, width=2).
-#[derive(Debug, PartialEq, Clone)]
+// Expose this struct to Python using #[pyclass]
+#[pyclass(get_all)] // get_all automatically creates Python getters for fields
+#[derive(Debug, PartialEq, Clone)] // Keep PartialEq for Property itself
 pub struct Property {
+    // `get_all` provides getters. Add `set` if modification from Python is needed.
+    #[pyo3(set)]
     pub key: String,
+    #[pyo3(set)]
     pub value: String,
 }
 
-/// Represents a single shape definition from a region file line.
-#[derive(Debug, PartialEq, Clone)]
-pub struct Shape {
-    pub shape_type: ShapeType,
-    pub coordinates: Vec<f64>,
-    pub properties: Vec<Property>,
+// Implement methods for the Property Python class
+#[pymethods]
+impl Property {
+    // Constructor for PyO3
+    #[new]
+    fn new(key: String, value: String) -> Self {
+        Property { key, value }
+    }
 }
+
+/// Represents a single shape definition from a region file line.
+// Expose this struct to Python using #[pyclass]
+#[pyclass]
+#[derive(Debug, Clone)] // Removed PartialEq due to Py<Property>
+pub struct Shape {
+    // We need Python-accessible fields. Use #[pyo3(get)] for getters.
+    #[pyo3(get)]
+    shape_type_str: String, // Store type as string for Python
+
+    #[pyo3(get)]
+    coordinates: Vec<f64>,
+
+    #[pyo3(get)]
+    properties: Vec<Py<Property>>, // Store properties as Python objects
+
+    // Keep original Rust fields private if needed, or remove if redundant
+    // No attribute needed to skip, just don't add #[pyo3(get/set)]
+    _internal_shape_type: ShapeType,
+}
+
+// Implement methods for the Shape Python class
+#[pymethods]
+impl Shape {
+    // Constructor for PyO3
+    // Accepts arguments that can be easily converted from Python types
+    #[new]
+    fn new(py: Python<'_>, shape_type_str: String, coordinates: Vec<f64>, properties_rust: Vec<Property>) -> PyResult<Self> {
+        // Convert Vec<Property> to Vec<Py<Property>> inside the constructor
+        let properties_py: Vec<Py<Property>> = properties_rust
+            .into_iter()
+            .map(|p| Py::new(py, p)) // Create Python instances
+            .collect::<PyResult<_>>()?; // Collect into PyResult<Vec<Py<Property>>>
+
+        // Reconstruct the internal enum from the string
+        let internal_shape_type = ShapeType::from_string_py(&shape_type_str);
+
+        Ok(Shape {
+            shape_type_str,
+            coordinates,
+            properties: properties_py,
+            _internal_shape_type: internal_shape_type,
+        })
+    }
+
+    // Example method if needed
+    // fn __repr__(&self) -> String {
+    //     format!("<Shape type='{}' ...>", self.shape_type_str)
+    // }
+}
+
 
 // --- Parser Implementation ---
 
@@ -135,12 +234,12 @@ fn parse_property_value<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
     )(input)
 }
 
-/// Parses a single property: `key=value`.
+/// Parses a single property: `key=value`. Returns the Rust struct.
 fn parse_property<'a>(input: Input<'a>) -> ParserResult<'a, Property> {
     // Wrap the entire combinator chain with context
     context(
         "key=value property",
-        // `separated_pair` parses three components: left, separator, right.
+        // Use map combinator function
         map(
             separated_pair(
                 parse_identifier,      // The key (e.g., "color")
@@ -156,13 +255,12 @@ fn parse_property<'a>(input: Input<'a>) -> ParserResult<'a, Property> {
 }
 
 
-/// Parses the optional properties/comment part after a shape definition.
-/// Starts with '#', followed by optional space-separated properties.
+/// Parses the optional properties/comment part after a shape definition. Returns Vec<Property>.
 fn parse_optional_properties<'a>(input: Input<'a>) -> ParserResult<'a, Vec<Property>> {
     // Wrap the entire combinator chain with context
     context(
         "optional properties section starting with #",
-        // `opt` makes the parser optional. It returns Option<Output>.
+        // Use map combinator function
         map( // Map the Option<Vec> to Vec
             opt(
                 // `preceded` ensures '#' and at least one whitespace character are present
@@ -173,7 +271,7 @@ fn parse_optional_properties<'a>(input: Input<'a>) -> ParserResult<'a, Vec<Prope
                         "list of properties",
                         separated_list0(
                             ws1, // Separator is one or more whitespace
-                            parse_property // Item parser
+                            parse_property // Item parser returns Rust Property struct
                         )
                     )
                 )
@@ -188,20 +286,20 @@ fn parse_optional_properties<'a>(input: Input<'a>) -> ParserResult<'a, Vec<Prope
 // --- Shape Parser ---
 
 /// Parses a full shape definition line (e.g., "circle(10, 20, 5) # color=red").
-/// Returns IResult containing the remaining input and the parsed Shape.
-pub fn parse_shape_definition<'a>(input: Input<'a>) -> ParserResult<'a, Shape> {
+/// Returns IResult containing the remaining input and the parsed Rust Shape struct data.
+pub fn parse_shape_definition<'a>(input: Input<'a>) -> ParserResult<'a, (ShapeType, Vec<f64>, Vec<Property>)> {
     // Wrap the entire combinator chain with context
     context(
         "shape definition",
-        // Use a tuple to parse sequence and map the result
+        // Use map combinator function correctly
         map(
             tuple((
                 parse_identifier, // 1. Shape keyword
                 parse_coordinates, // 2. Coordinates
                 parse_optional_properties // 3. Optional properties after '#'
             )),
-            |(shape_keyword, coords, props)| { // Deconstruct the tuple
-                // 4. Map the parsed keyword string to the ShapeType enum
+            // Map the result tuple into our internal representation
+            |(shape_keyword, coords, props)| {
                 let shape_type = match shape_keyword.to_lowercase().as_str() {
                     "circle" => ShapeType::Circle,
                     "ellipse" => ShapeType::Ellipse,
@@ -211,161 +309,164 @@ pub fn parse_shape_definition<'a>(input: Input<'a>) -> ParserResult<'a, Shape> {
                     "line" => ShapeType::Line,
                     _ => ShapeType::Unsupported(shape_keyword.to_string()),
                 };
-
-                // 5. Construct and return the Shape struct
-                Shape {
-                    shape_type,
-                    coordinates: coords,
-                    properties: props,
-                }
+                (shape_type, coords, props)
             }
         )
     )(input)
 }
 
 
-// --- Main Parsing Function (Example Entry Point) ---
+// --- Main Parsing Function (Internal Rust) ---
 
 /// Parses a single line expected to contain a region shape definition.
 /// Handles leading/trailing whitespace and ensures the entire line is consumed.
-/// Returns Result<Shape, ParseError>
-pub fn parse_single_region_line(line: &str) -> Result<Shape, String> {
+/// Returns Result<(ShapeType, Vec<f64>, Vec<Property>), String>
+pub fn parse_single_region_line_internal(line: &str) -> Result<(ShapeType, Vec<f64>, Vec<Property>), String> {
     // Define the full line parser: optional whitespace, shape definition, optional whitespace, end of input
     let mut parser = terminated(
-        preceded(ws, parse_shape_definition),
+        preceded(ws, parse_shape_definition), // parse_shape_definition returns the tuple
         ws // Consume trailing whitespace before checking eof implicitly with finish
     );
 
-    // Use `.finish()` to convert IResult to standard Result and ensure all input is consumed.
-    // It returns Result<Output, Error> if successful and all input is parsed,
-    // or Err<Error> otherwise.
     match parser(line).finish() {
-        Ok((_remaining_input, shape)) => {
-             // finish() ensures remaining_input is empty on Ok
-             Ok(shape)
+        Ok((_remaining_input, (shape_type, coords, props))) => {
+             Ok((shape_type, coords, props))
         },
         Err(e) => {
-            // Convert nom's VerboseError into a readable string
-            // nom::error::convert_error provides a helper for this
             Err(nom::error::convert_error(line, e))
         }
     }
 }
 
+// --- Python Function ---
 
-// --- Unit Tests ---
+/// Parses a single region line string and returns a Shape object.
+/// Raises ValueError on parsing failure.
+#[pyfunction]
+fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<Py<Shape>> {
+    match parse_single_region_line_internal(line) {
+        Ok((shape_type, coords, props_rust)) => {
+            // Create the Python Shape object using its #[new] constructor
+            // Pass the necessary arguments that can be converted from Rust types
+            let shape_obj = Shape::new(
+                py, // Pass Python context
+                shape_type.to_string_py(), // Convert enum to string
+                coords,
+                props_rust // Pass the Vec<Property> directly
+            )?;
+            // Wrap the created Rust struct instance in Py<>
+            Ok(Py::new(py, shape_obj)?)
+        }
+        Err(e_str) => {
+            // Convert the Rust error string into a Python ValueError
+            Err(PyValueError::new_err(e_str))
+        }
+    }
+}
+
+
+// --- Python Module Definition ---
+
+/// A Python module implemented in Rust for parsing DS9 region files.
+#[pymodule]
+fn rusty_region_parser(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(parse_region_line, m)?)?;
+    m.add_class::<Shape>()?;
+    m.add_class::<Property>()?;
+    Ok(())
+}
+
+
+// --- Unit Tests (Rust tests remain unchanged) ---
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    macro_rules! assert_parses {
-        ($input:expr, $expected:expr) => {
-            match parse_single_region_line($input) {
-                Ok(shape) => assert_eq!(shape, $expected),
-                Err(e_str) => panic!("Parsing failed for '{}':\n{}", $input, e_str), // Show formatted error string
+    // Test the internal Rust function directly
+     macro_rules! assert_internal_parses {
+        ($input:expr, $expected_type:pat, $expected_coords:expr, $expected_props_len:expr) => {
+            match parse_single_region_line_internal($input) {
+                Ok((shape_type, coords, props)) => {
+                    assert!(matches!(shape_type, $expected_type), "Shape type mismatch");
+                    assert_eq!(coords, $expected_coords, "Coordinate mismatch");
+                    assert_eq!(props.len(), $expected_props_len, "Property count mismatch");
+                },
+                Err(e_str) => panic!("Internal parsing failed for '{}':\n{}", $input, e_str),
             }
         };
     }
 
-     macro_rules! assert_fails {
+     macro_rules! assert_internal_fails {
         ($input:expr) => {
-            let result = parse_single_region_line($input);
+            let result = parse_single_region_line_internal($input);
              if result.is_ok() {
-                 panic!("Parsing should have failed for '{}' but succeeded with: {:?}", $input, result.unwrap());
+                 panic!("Internal parsing should have failed for '{}' but succeeded with: {:?}", $input, result.unwrap());
              }
-             // Optionally print the error for debugging failed tests
-             // if let Err(e_str) = result {
-             //     eprintln!("Input '{}' correctly failed with:\n{}", $input, e_str);
-             // }
              assert!(result.is_err());
         };
-         // Matching specific nom errors can be complex, often easier to just assert failure
-         // ($input:expr, $expected_error_variant:pat) => { ... }
     }
 
 
     #[test]
-    fn test_parse_simple_circle() {
+    fn test_internal_parse_simple_circle() {
         let line = "circle(100, 200, 30)";
-        let expected = Shape {
-            shape_type: ShapeType::Circle,
-            coordinates: vec![100.0, 200.0, 30.0],
-            properties: vec![],
-        };
-        assert_parses!(line, expected);
+        assert_internal_parses!(line, ShapeType::Circle, vec![100.0, 200.0, 30.0], 0);
     }
 
-    #[test]
-    fn test_parse_circle_with_whitespace() {
+     #[test]
+    fn test_internal_parse_circle_with_whitespace() {
         let line = "  circle  ( 100.5 ,  200 , 30 )   ";
-        let expected = Shape {
-            shape_type: ShapeType::Circle,
-            coordinates: vec![100.5, 200.0, 30.0],
-            properties: vec![],
-        };
-        assert_parses!(line, expected);
+        assert_internal_parses!(line, ShapeType::Circle, vec![100.5, 200.0, 30.0], 0);
     }
 
 
-    #[test]
-    fn test_parse_circle_with_properties() {
+     #[test]
+    fn test_internal_parse_circle_with_properties() {
         let line = "circle( 10.5, 20 , 5.0 ) # color=red width=2 tag=foo";
-        let expected = Shape {
-            shape_type: ShapeType::Circle,
-            coordinates: vec![10.5, 20.0, 5.0],
-            properties: vec![
-                Property { key: "color".to_string(), value: "red".to_string() },
-                Property { key: "width".to_string(), value: "2".to_string() },
-                Property { key: "tag".to_string(), value: "foo".to_string() },
-            ],
-        };
-        assert_parses!(line, expected);
+         assert_internal_parses!(line, ShapeType::Circle, vec![10.5, 20.0, 5.0], 3);
+         // Could add more detailed property checks here if needed
+         match parse_single_region_line_internal(line) {
+             Ok((_, _, props)) => {
+                 assert_eq!(props[0], Property { key: "color".to_string(), value: "red".to_string() });
+                 assert_eq!(props[1], Property { key: "width".to_string(), value: "2".to_string() });
+                 assert_eq!(props[2], Property { key: "tag".to_string(), value: "foo".to_string() });
+             },
+             _ => panic!("Should have parsed successfully"),
+         }
     }
 
-     #[test]
-    fn test_parse_ellipse() {
+      #[test]
+    fn test_internal_parse_ellipse() {
         let line = "ellipse(500, 500, 20.1, 10.9, 45)";
-         let expected = Shape {
-            shape_type: ShapeType::Ellipse,
-            coordinates: vec![500.0, 500.0, 20.1, 10.9, 45.0],
-            properties: vec![],
-        };
-        assert_parses!(line, expected);
+        assert_internal_parses!(line, ShapeType::Ellipse, vec![500.0, 500.0, 20.1, 10.9, 45.0], 0);
     }
 
-     #[test]
-    fn test_invalid_syntax_missing_coord() {
+      #[test]
+    fn test_internal_invalid_syntax_missing_coord() {
         let line = "circle(100, 200, )";
-        assert_fails!(line);
+        assert_internal_fails!(line);
     }
 
-     #[test]
-    fn test_invalid_syntax_unclosed_paren() {
+      #[test]
+    fn test_internal_invalid_syntax_unclosed_paren() {
         let line = "circle(100, 200, 30";
-        assert_fails!(line);
+        assert_internal_fails!(line);
     }
 
-     // REMOVED: test_trailing_input_error
-
-     #[test]
-    fn test_unsupported_shape() {
+      #[test]
+    fn test_internal_unsupported_shape() {
         let line = "vector(1, 2, 10, 0) # property=value";
-         let expected_coords = vec![1.0, 2.0, 10.0, 0.0];
-         let expected_props = vec![Property { key: "property".to_string(), value: "value".to_string() }];
-
-         match parse_single_region_line(line) {
-            Ok(shape) => {
-                match &shape.shape_type {
-                    ShapeType::Unsupported(s) if s.eq_ignore_ascii_case("vector") => (),
-                    _ => panic!("Expected ShapeType::Unsupported(\"vector\"), got {:?}", shape.shape_type),
-                }
-                assert_eq!(shape.coordinates, expected_coords);
-                assert_eq!(shape.properties, expected_props);
-            },
-            Err(e_str) => panic!("Parsing failed for '{}':\n{}", line, e_str),
-        }
+         assert_internal_parses!(line, ShapeType::Unsupported(_), vec![1.0, 2.0, 10.0, 0.0], 1);
+         match parse_single_region_line_internal(line) {
+             Ok((shape_type, _, props)) => {
+                 match shape_type {
+                     ShapeType::Unsupported(s) => assert!(s.eq_ignore_ascii_case("vector")),
+                     _ => panic!("Expected Unsupported shape type"),
+                 }
+                 assert_eq!(props[0], Property { key: "property".to_string(), value: "value".to_string() });
+             },
+             _ => panic!("Should have parsed successfully"),
+         }
     }
-
-     // REMOVED: test_property_parsing_robustness_needed
 
 }
