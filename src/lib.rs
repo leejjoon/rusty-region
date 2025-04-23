@@ -5,17 +5,22 @@
 
 // --- Module Imports ---
 use winnow::prelude::*;
+// Keep take_until imported for potential future use in parse_property_value enhancement
 use winnow::token::{take_while, take_until};
 use winnow::combinator::{opt, preceded, terminated, separated_pair, separated};
 use winnow::ascii::{float, multispace0, multispace1, alphanumeric1};
+// Suppress the deprecation warning specifically for ErrorKind, as it's needed for the trait impl
+#[allow(deprecated)]
 use winnow::error::{ParserError as WinnowParserError, ErrorKind, AddContext as WinnowAddContext};
 use winnow::stream::Stream; // Import Stream trait for bounds and methods like `checkpoint`
+
 
 // --- Custom Error Type ---
 // Input type I needs to be bound by Stream + Clone
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError<I> {
-    Winnow(I, ErrorKind),
+    // Store ErrorKind as a string to avoid direct use of the deprecated type
+    Winnow(I, String), // Changed ErrorKind to String
     Context(I, &'static str, Box<Self>),
     Custom(I, String),
     Incomplete(I, String),
@@ -24,17 +29,22 @@ pub enum ParseError<I> {
 // Implement winnow::error::ParserError for our custom error type
 // Add the `Stream` trait bound for `I`
 impl<I: Stream + Clone> WinnowParserError<I> for ParseError<I> {
+    // Convert the deprecated ErrorKind to a String here
+    #[allow(deprecated)] // Allow using ErrorKind in the signature
     fn from_error_kind(input: &I, kind: ErrorKind) -> Self {
-        ParseError::Winnow(input.clone(), kind)
+        ParseError::Winnow(input.clone(), format!("{:?}", kind)) // Store as String
     }
 
-    // The signature requires a checkpoint, which marks a position in the input stream
+    // Convert the deprecated ErrorKind to a String here
+    #[allow(deprecated)] // Allow using ErrorKind in the signature
     fn append(self, input: &I, _checkpoint: &<I as Stream>::Checkpoint, kind: ErrorKind) -> Self {
-        // Append new error info. This implementation simply replaces the old Winnow error.
+        let error_string = format!("{:?}", kind); // Store as String
         match self {
-            ParseError::Winnow(_, _) => ParseError::Winnow(input.clone(), kind),
+            // Replace previous Winnow error string
+            ParseError::Winnow(_, _) => ParseError::Winnow(input.clone(), error_string),
             ParseError::Context(i, ctx, inner) => ParseError::Context(i, ctx, Box::new(inner.append(input, _checkpoint, kind))),
-            _ => ParseError::Winnow(input.clone(), kind),
+            // If appending to a Custom or Incomplete error, maybe wrap it or create a new Winnow error
+            _ => ParseError::Winnow(input.clone(), error_string), // Default: create a new Winnow error
         }
     }
 }
@@ -81,40 +91,37 @@ pub struct Shape {
 
 // Define Input type alias for clarity
 type Input<'a> = &'a str;
-// Define a type alias for the result type using PResult and our custom error
-// Note: The Input type `&'a str` implements Stream + Clone implicitly.
-type PResult<'a, O> = winnow::PResult<O, ParseError<Input<'a>>>;
+// Define a type alias using winnow::PResult (which is the standard Result type for parsers)
+type ParserResult<'a, O> = winnow::PResult<O, ParseError<Input<'a>>>;
 
 // --- Basic Parsers ---
 
-/// Parses zero or more whitespace characters. Returns PResult<()>
-fn ws<'a>(input: &mut Input<'a>) -> PResult<'a, ()> {
+/// Parses zero or more whitespace characters. Returns ParserResult<()>
+fn ws<'a>(input: &mut Input<'a>) -> ParserResult<'a, ()> {
     multispace0.void().parse_next(input)
 }
 
-/// Parses one or more whitespace characters. Returns PResult<()>
-fn ws1<'a>(input: &mut Input<'a>) -> PResult<'a, ()> {
+/// Parses one or more whitespace characters. Returns ParserResult<()>
+fn ws1<'a>(input: &mut Input<'a>) -> ParserResult<'a, ()> {
     multispace1.void().parse_next(input)
 }
 
 
-/// Parses a floating point number (f64), consuming surrounding whitespace. Returns PResult<f64>
-fn parse_f64<'a>(input: &mut Input<'a>) -> PResult<'a, f64> {
-    // Use function combinators `preceded` and `terminated` correctly
+/// Parses a floating point number (f64), consuming surrounding whitespace. Returns ParserResult<f64>
+fn parse_f64<'a>(input: &mut Input<'a>) -> ParserResult<'a, f64> {
     terminated(
-        preceded(ws, float), // Parse float after leading whitespace
-        ws                   // Consume trailing whitespace
+        preceded(ws, float),
+        ws
     )
     .context("floating point number")
     .parse_next(input)
 }
 
-/// Parses an identifier (alphanumeric string, e.g., shape names, property keys). Returns PResult<&str>
-fn parse_identifier<'a>(input: &mut Input<'a>) -> PResult<'a, &'a str> {
-    // Use function combinators `preceded` and `terminated` correctly
+/// Parses an identifier (alphanumeric string, e.g., shape names, property keys). Returns ParserResult<&str>
+fn parse_identifier<'a>(input: &mut Input<'a>) -> ParserResult<'a, &'a str> {
     terminated(
-        preceded(ws, alphanumeric1), // Parse identifier after leading whitespace
-        ws                           // Consume trailing whitespace
+        preceded(ws, alphanumeric1),
+        ws
     )
     .context("identifier (letters/numbers)")
     .parse_next(input)
@@ -123,14 +130,12 @@ fn parse_identifier<'a>(input: &mut Input<'a>) -> PResult<'a, &'a str> {
 
 // --- Component Parsers ---
 
-/// Parses a list of coordinates enclosed in parentheses: `( N, N, N, ... )`. Returns PResult<Vec<f64>>
-fn parse_coordinates<'a>(input: &mut Input<'a>) -> PResult<'a, Vec<f64>> {
+/// Parses a list of coordinates enclosed in parentheses: `( N, N, N, ... )`. Returns ParserResult<Vec<f64>>
+fn parse_coordinates<'a>(input: &mut Input<'a>) -> ParserResult<'a, Vec<f64>> {
     preceded(
         (ws, '(').context("opening parenthesis for coordinates"),
         terminated(
-            // `separated` with a range (1..) implicitly collects into Vec
             separated(1.., parse_f64, (ws, ',', ws))
-                 // REMOVED .collect::<Vec<_>>() - `separated` handles collection
                  .context("comma-separated coordinates list"),
             (ws, ')').context("closing parenthesis for coordinates")
         )
@@ -139,9 +144,9 @@ fn parse_coordinates<'a>(input: &mut Input<'a>) -> PResult<'a, Vec<f64>> {
     .parse_next(input)
 }
 
-/// Parses a property value. Returns PResult<&str>
+/// Parses a property value. Returns ParserResult<&str>
 /// This is still a simplified version.
-fn parse_property_value<'a>(input: &mut Input<'a>) -> PResult<'a, &'a str> {
+fn parse_property_value<'a>(input: &mut Input<'a>) -> ParserResult<'a, &'a str> {
     // Basic approach: take characters until the next whitespace or '#' or end of input.
     // TODO: Enhance this parser significantly for real-world region files (quotes, braces).
     take_while(1.., |c: char| !c.is_whitespace() && c != '#')
@@ -149,12 +154,12 @@ fn parse_property_value<'a>(input: &mut Input<'a>) -> PResult<'a, &'a str> {
         .parse_next(input)
 }
 
-/// Parses a single property: `key=value`. Returns PResult<Property>
-fn parse_property<'a>(input: &mut Input<'a>) -> PResult<'a, Property> {
+/// Parses a single property: `key=value`. Returns ParserResult<Property>
+fn parse_property<'a>(input: &mut Input<'a>) -> ParserResult<'a, Property> {
     separated_pair(
-        parse_identifier,      // The key
-        (ws, '=', ws),         // The separator
-        parse_property_value   // The value
+        parse_identifier,
+        (ws, '=', ws),
+        parse_property_value
     )
     .map(|(key_str, value_str)| Property {
         key: key_str.to_string(),
@@ -165,15 +170,13 @@ fn parse_property<'a>(input: &mut Input<'a>) -> PResult<'a, Property> {
 }
 
 
-/// Parses the optional properties/comment part after a shape definition. Returns PResult<Vec<Property>>
+/// Parses the optional properties/comment part after a shape definition. Returns ParserResult<Vec<Property>>
 /// Starts with '#', followed by optional space-separated properties.
-fn parse_optional_properties<'a>(input: &mut Input<'a>) -> PResult<'a, Vec<Property>> {
+fn parse_optional_properties<'a>(input: &mut Input<'a>) -> ParserResult<'a, Vec<Property>> {
     opt(
         preceded(
             (ws, '#', ws1).context("property marker '#' followed by space"),
-            // `separated` with a range (0..) implicitly collects into Vec
             separated(0.., parse_property, ws1)
-                // REMOVED .collect::<Vec<_>>() - `separated` handles collection
                 .context("list of properties")
         )
     )
@@ -184,8 +187,8 @@ fn parse_optional_properties<'a>(input: &mut Input<'a>) -> PResult<'a, Vec<Prope
 
 // --- Shape Parser ---
 
-/// Parses a full shape definition line (e.g., "circle(10, 20, 5) # color=red"). Returns PResult<Shape>
-pub fn parse_shape_definition<'a>(input: &mut Input<'a>) -> PResult<'a, Shape> {
+/// Parses a full shape definition line (e.g., "circle(10, 20, 5) # color=red"). Returns ParserResult<Shape>
+pub fn parse_shape_definition<'a>(input: &mut Input<'a>) -> ParserResult<'a, Shape> {
     let shape_keyword = parse_identifier.context("shape keyword (e.g., circle, box)").parse_next(input)?;
     let coords = parse_coordinates.context("shape coordinates").parse_next(input)?;
     let props = parse_optional_properties.context("optional shape properties").parse_next(input)?;
@@ -214,13 +217,11 @@ pub fn parse_shape_definition<'a>(input: &mut Input<'a>) -> PResult<'a, Shape> {
 /// Handles leading/trailing whitespace and ensures the entire line is consumed.
 pub fn parse_single_region_line(line: &str) -> Result<Shape, ParseError<Input>> {
     let mut parser = preceded(ws, parse_shape_definition);
-    let original_line = line; // Keep original line ref for potential error reporting
+    let original_line = line;
     let mut input = line;
 
     match parser.parse_next(&mut input) {
         Ok(shape) => {
-            // Check for remaining non-whitespace input
-            // Remove the incorrect generic argument `::<_>` from `ws`
             match ws.parse_next(&mut input) {
                 Ok(_) => {
                     if input.is_empty() {
@@ -229,16 +230,14 @@ pub fn parse_single_region_line(line: &str) -> Result<Shape, ParseError<Input>> 
                         Err(ParseError::Incomplete(input, format!("Trailing input after shape definition: '{}'", input)))
                     }
                 }
-                // Handle ErrMode explicitly instead of using .into()
                 Err(e) => Err(match e {
                      winnow::error::ErrMode::Incomplete(_) => ParseError::Custom(input, "Parser needed more input during trailing whitespace check".to_string()),
-                     winnow::error::ErrMode::Cut(err) => err, // Already our ParseError type
-                     winnow::error::ErrMode::Backtrack(err) => err, // Already our ParseError type
+                     winnow::error::ErrMode::Cut(err) => err,
+                     winnow::error::ErrMode::Backtrack(err) => err,
                  })
             }
         }
         Err(e) => {
-            // Convert winnow::error::ErrMode into our ParseError
              Err(match e {
                  winnow::error::ErrMode::Incomplete(_) => ParseError::Custom(original_line, "Parser needed more input".to_string()),
                  winnow::error::ErrMode::Cut(err) => err,
@@ -252,9 +251,8 @@ pub fn parse_single_region_line(line: &str) -> Result<Shape, ParseError<Input>> 
 // --- Unit Tests ---
 #[cfg(test)]
 mod tests {
-    use super::*; // Import everything from the parent module (lib.rs)
+    use super::*;
 
-    // Helper macro for cleaner tests expecting Ok result
     macro_rules! assert_parses {
         ($input:expr, $expected:expr) => {
             match parse_single_region_line($input) {
@@ -264,8 +262,7 @@ mod tests {
         };
     }
 
-     // Helper macro for cleaner tests expecting Err result
-    macro_rules! assert_fails {
+     macro_rules! assert_fails {
         ($input:expr) => {
             assert!(parse_single_region_line($input).is_err(), "Parsing should have failed for '{}'", $input);
         };
@@ -273,9 +270,6 @@ mod tests {
             let result = parse_single_region_line($input);
              assert!(result.is_err(), "Parsing should have failed for '{}'", $input);
              if let Err(e) = result {
-                 // Use std::mem::discriminant for pattern matching on enums with associated data
-                 // if the simple matches! macro isn't sufficient or causes issues.
-                 // For now, matches! should work for top-level enum variants.
                  assert!(matches!(e, $expected_error_variant), "Expected error variant {} but got {:?}", stringify!($expected_error_variant), e);
              }
         };
@@ -322,7 +316,7 @@ mod tests {
 
      #[test]
     fn test_parse_ellipse() {
-        let line = "ellipse(500, 500, 20.1, 10.9, 45)"; // x, y, r1, r2, angle
+        let line = "ellipse(500, 500, 20.1, 10.9, 45)";
          let expected = Shape {
             shape_type: ShapeType::Ellipse,
             coordinates: vec![500.0, 500.0, 20.1, 10.9, 45.0],
@@ -333,22 +327,22 @@ mod tests {
 
      #[test]
     fn test_invalid_syntax_missing_coord() {
-        let line = "circle(100, 200, )"; // Invalid syntax: missing coordinate
-        // Expect a winnow error or context error during float parsing
+        let line = "circle(100, 200, )";
+        // Now expect Winnow error with a string representation
         assert_fails!(line, ParseError::Winnow(_,_) | ParseError::Context(_,_,_));
     }
 
      #[test]
     fn test_invalid_syntax_unclosed_paren() {
-        let line = "circle(100, 200, 30"; // Invalid syntax: unclosed parenthesis
-        // Expect a winnow error or context error looking for ')'
+        let line = "circle(100, 200, 30";
+        // Now expect Winnow error with a string representation
          assert_fails!(line, ParseError::Winnow(_,_) | ParseError::Context(_,_,_));
     }
 
      #[test]
     fn test_trailing_input_error() {
-        let line = "circle(100, 200, 30) unexpected text"; // Trailing text not part of properties
-        assert_fails!(line, ParseError::Incomplete(_, _)); // Expect Incomplete error due to remaining input
+        let line = "circle(100, 200, 30) unexpected text";
+        assert_fails!(line, ParseError::Incomplete(_, _));
     }
 
 
@@ -376,9 +370,9 @@ mod tests {
         let line = r#"point(10, 10) # text={This has spaces} tag="quoted value""#;
         let result = parse_single_region_line(line);
 
-        // Expect Incomplete error because simple parser stops at the space after '{This'
         assert!(result.is_err(), "Parsing should fail or be incomplete due to simple property value parser");
         if let Err(e) = result {
+             // The error might be Incomplete or a Winnow/Context error during property parsing
              assert!(matches!(e, ParseError::Incomplete(_, _) | ParseError::Winnow(_,_) | ParseError::Context(_, _, _)),
                 "Expected Incomplete or other parse error due to simple property value parser, but got {:?}", e);
              eprintln!("Note: Test `test_property_parsing_robustness_needed` correctly identified failure/limitation of simple property value parser for line: '{}'. Error: {:?}", line, e);
