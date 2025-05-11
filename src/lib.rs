@@ -6,368 +6,396 @@
 
 // --- PyO3 Imports ---
 use pyo3::prelude::*;
-use pyo3::exceptions::PyValueError; // For raising Python errors
-// use pyo3::types::PyList; // Unused
+use pyo3::exceptions::PyValueError;
 
-// --- Module Imports ---
+// --- Nom Imports ---
 use nom::{
-    IResult, // Standard nom result type: Result<(Input, Output), Err<Error>>
-    // Err as NomErr, // Unused
-    character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char}, // Removed unused space1
-    bytes::complete::{take_while1}, // Removed unused tag
-    combinator::{map, opt}, // Removed unused value
-    sequence::{preceded, terminated, separated_pair, tuple}, // Sequence combinators
-    multi::{separated_list0, separated_list1}, // List combinators
-    number::complete::double, // Floating point number parser
-    // branch::alt, // Unused
-    error::{VerboseError, context}, // Renamed trait import
-    Finish, // Used to convert IResult to standard Result and ensure full consumption
-    // Parser, // Unused
+    IResult,
+    character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char},
+    bytes::complete::take_while1,
+    combinator::{map, map_res, opt}, // Added map_res
+    sequence::{preceded, terminated, separated_pair, tuple},
+    multi::{separated_list0, separated_list1},
+    number::complete::double,
+    error::{VerboseError, context, ParseError as NomParseErrorTrait, ContextError}, // Added ContextError trait
+    Finish,
+    Parser,
 };
+use std::collections::HashMap; // For storing shape definitions
 
-// --- Custom Error Type (Optional but recommended for better errors) ---
-// Using nom's VerboseError for potentially more detailed debugging info.
-// You could define your own enum implementing nom::error::ParseError.
-type Error<'a> = VerboseError<&'a str>;
+// --- Custom Error Type for Nom ---
+type NomVerboseError<'a> = VerboseError<&'a str>;
+
+// --- Semantic Type Definitions ---
+
+/// Describes the semantic meaning of a coordinate parameter for a shape.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum SemanticCoordType {
+    CoordOdd,   // e.g., RA, X
+    CoordEven,  // e.g., Dec, Y
+    Distance,   // e.g., radius, width, height
+    Angle,      // e.g., rotation angle, start/end angle for pie
+    Integer,    // e.g., number of annulus sectors (parsed as f64 for now)
+}
+
+/// Defines the expected coordinate signature for a shape.
+#[derive(Debug, Clone)]
+pub struct ShapeSignature {
+    pub name: &'static str, // For error messages
+    /// Parameters that appear before any repeating block.
+    pub fixed_head: &'static [SemanticCoordType],
+    /// The sequence of types that forms a single repeating unit.
+    pub repeat_unit: Option<&'static [SemanticCoordType]>,
+    /// Minimum number of times the `repeat_unit` must appear.
+    /// If `repeat_unit` is None, this should typically be 0.
+    pub min_repeats: usize,
+    /// Maximum number of times the `repeat_unit` can appear.
+    /// `None` means unbounded. If `repeat_unit` is None, this is irrelevant.
+    pub max_repeats: Option<usize>,
+    /// Parameters that appear after all repeating blocks.
+    pub fixed_tail: &'static [SemanticCoordType],
+}
+
 
 // --- Data Structures ---
 
-/// Represents the type of a geometric shape found in a region file.
-// Note: This is kept as a Rust enum internally. We'll convert it to a string for Python.
+/// Represents the type of a geometric shape. (Rust internal)
 #[derive(Debug, PartialEq, Clone)]
 pub enum ShapeType {
-    Circle,
-    Ellipse,
-    Box,
-    Polygon,
-    Point,
-    Line,
+    Circle, Ellipse, Box, RotBox, Polygon, Point, Line, Annulus, Pie,
+    Panda, Epanda, Bpanda, Vector, Text,
     Unsupported(String),
 }
 
 impl ShapeType {
-    /// Converts the enum variant to a string representation.
     fn to_string_py(&self) -> String {
         match self {
-            ShapeType::Circle => "circle".to_string(),
-            ShapeType::Ellipse => "ellipse".to_string(),
-            ShapeType::Box => "box".to_string(),
-            ShapeType::Polygon => "polygon".to_string(),
-            ShapeType::Point => "point".to_string(),
-            ShapeType::Line => "line".to_string(),
-            ShapeType::Unsupported(s) => format!("unsupported({})", s),
-        }
-    }
-
-    /// Converts a string back to the enum variant (basic implementation).
-    fn from_string_py(s: &str) -> Self {
-        match s {
-            "circle" => ShapeType::Circle,
-            "ellipse" => ShapeType::Ellipse,
-            "box" => ShapeType::Box,
-            "polygon" => ShapeType::Polygon,
-            "point" => ShapeType::Point,
-            "line" => ShapeType::Line,
-            // Basic handling for unsupported, might need refinement
-            _ if s.starts_with("unsupported(") && s.ends_with(')') => {
-                ShapeType::Unsupported(s["unsupported(".len()..s.len()-1].to_string())
-            }
-            _ => ShapeType::Unsupported(s.to_string()), // Default fallback
-        }
+            ShapeType::Circle => "circle", ShapeType::Ellipse => "ellipse", ShapeType::Box => "box",
+            ShapeType::RotBox => "rotbox", ShapeType::Polygon => "polygon", ShapeType::Point => "point",
+            ShapeType::Line => "line", ShapeType::Annulus => "annulus", ShapeType::Pie => "pie",
+            ShapeType::Panda => "panda", ShapeType::Epanda => "epanda", ShapeType::Bpanda => "bpanda",
+            ShapeType::Vector => "vector", ShapeType::Text => "text",
+            ShapeType::Unsupported(s) => return format!("unsupported({})", s),
+        }.to_string()
     }
 }
 
-
-/// Represents a key-value property associated with a shape (e.g., color=red, width=2).
-// Expose this struct to Python using #[pyclass]
-#[pyclass(get_all)] // get_all automatically creates Python getters for fields
-#[derive(Debug, PartialEq, Clone)] // Keep PartialEq for Property itself
+/// Represents a key-value property. (Exposed to Python)
+#[pyclass(get_all, set_all)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Property {
-    // `get_all` provides getters. Add `set` if modification from Python is needed.
-    #[pyo3(set)]
     pub key: String,
-    #[pyo3(set)]
     pub value: String,
 }
 
-// Implement methods for the Property Python class
 #[pymethods]
 impl Property {
-    // Constructor for PyO3
     #[new]
-    fn new(key: String, value: String) -> Self {
-        Property { key, value }
-    }
+    fn new(key: String, value: String) -> Self { Property { key, value } }
 }
 
-/// Represents a single shape definition from a region file line.
-// Expose this struct to Python using #[pyclass]
+/// Represents a parsed shape. (Exposed to Python)
 #[pyclass]
-#[derive(Debug, Clone)] // Removed PartialEq due to Py<Property>
+#[derive(Debug, Clone)]
 pub struct Shape {
-    // We need Python-accessible fields. Use #[pyo3(get)] for getters.
     #[pyo3(get)]
-    shape_type_str: String, // Store type as string for Python
-
+    shape_type_str: String,
     #[pyo3(get)]
-    coordinates: Vec<f64>,
-
+    coordinates: Vec<f64>, // Still Vec<f64> for now
     #[pyo3(get)]
-    properties: Vec<Py<Property>>, // Store properties as Python objects
-
-    // Keep original Rust fields private if needed, or remove if redundant
-    // No attribute needed to skip, just don't add #[pyo3(get/set)]
-    _internal_shape_type: ShapeType,
+    properties: Vec<Py<Property>>, // Python objects
 }
 
-// Implement methods for the Shape Python class
 #[pymethods]
 impl Shape {
-    // Constructor for PyO3
-    // Accepts arguments that can be easily converted from Python types
     #[new]
-    fn new(py: Python<'_>, shape_type_str: String, coordinates: Vec<f64>, properties_rust: Vec<Property>) -> PyResult<Self> {
-        // Convert Vec<Property> to Vec<Py<Property>> inside the constructor
-        let properties_py: Vec<Py<Property>> = properties_rust
-            .into_iter()
-            .map(|p| Py::new(py, p)) // Create Python instances
-            .collect::<PyResult<_>>()?; // Collect into PyResult<Vec<Py<Property>>>
-
-        // Reconstruct the internal enum from the string
-        let internal_shape_type = ShapeType::from_string_py(&shape_type_str);
-
-        Ok(Shape {
-            shape_type_str,
-            coordinates,
-            properties: properties_py,
-            _internal_shape_type: internal_shape_type,
-        })
+    fn new(shape_type_str: String, coordinates: Vec<f64>, properties: Vec<Py<Property>>) -> Self {
+        Shape { shape_type_str, coordinates, properties }
     }
-
-    // Example method if needed
-    // fn __repr__(&self) -> String {
-    //     format!("<Shape type='{}' ...>", self.shape_type_str)
-    // }
 }
-
 
 // --- Parser Implementation ---
 
-// Define Input type alias for clarity
 type Input<'a> = &'a str;
-// Define a type alias for nom's IResult using our VerboseError
-type ParserResult<'a, O> = IResult<Input<'a>, O, Error<'a>>;
+type ParserResult<'a, O> = IResult<Input<'a>, O, NomVerboseError<'a>>;
 
 // --- Basic Parsers ---
+fn ws<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { multispace0(input) }
+fn ws1<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { multispace1(input) }
 
-/// Parses zero or more whitespace characters, returning the input slice.
-fn ws<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
-    multispace0(input)
-}
-
-/// Parses one or more whitespace characters, returning the input slice.
-fn ws1<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
-    multispace1(input) // Or use space1 for only spaces/tabs
-}
-
-
-/// Parses a floating point number (f64), consuming surrounding whitespace.
 fn parse_f64<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    // Wrap the entire combinator chain with context
-    context(
-        "floating point number",
-        terminated(
-            preceded(ws, double), // Use nom's double parser
-            ws
-        )
-    )(input)
+    context("floating point number", preceded(ws, terminated(double, ws)))(input)
 }
 
-/// Parses an identifier (alphanumeric string, e.g., shape names, property keys).
-fn parse_identifier<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
-    // Wrap the entire combinator chain with context
-    context(
-        "identifier (letters/numbers)",
-        terminated(
-            preceded(ws, alphanumeric1),
-            ws
-        )
-    )(input)
+fn parse_identifier_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
+    context("identifier", preceded(ws, terminated(alphanumeric1, ws)))(input)
 }
-
 
 // --- Component Parsers ---
-
-/// Parses a list of coordinates enclosed in parentheses: `( N, N, N, ... )`.
-fn parse_coordinates<'a>(input: Input<'a>) -> ParserResult<'a, Vec<f64>> {
-    // Wrap the entire combinator chain with context
+fn parse_coordinates_list_f64<'a>(input: Input<'a>) -> ParserResult<'a, Vec<f64>> {
     context(
-        "coordinate list in parentheses",
+        "coordinate list",
         preceded(
-            // Use context function around the parser it describes
-            context("opening parenthesis for coordinates", tuple((ws, nom_char('(')))),
+            context("opening parenthesis", tuple((ws, nom_char('(')))),
             terminated(
-                // Use context function around the parser it describes
-                context(
-                    "comma-separated coordinates list",
-                    separated_list1(
-                        context("coordinate separator comma", tuple((ws, nom_char(','), ws))), // Separator parser
-                        parse_f64 // Item parser
-                    )
+                nom::multi::separated_list1(
+                    context("coordinate separator comma", tuple((ws, nom_char(','), ws))),
+                    parse_f64
                 ),
-                // Use context function around the parser it describes
-                context("closing parenthesis for coordinates", tuple((ws, nom_char(')'))))
+                context("closing parenthesis", tuple((ws, nom_char(')'))))
             )
         )
     )(input)
 }
 
-/// Parses a property value.
-/// This is still a simplified version.
-fn parse_property_value<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
-    // Wrap the entire combinator chain with context
-    context(
-        "property value (simple version)",
-        // Basic approach: take characters until the next whitespace or '#' or end of input.
-        // TODO: Enhance this parser significantly for real-world region files (quotes, braces).
-        take_while1(|c: char| !c.is_whitespace() && c != '#')
-    )(input)
+fn parse_property_value_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
+    context("property value", take_while1(|c: char| !c.is_whitespace() && c != '#'))(input)
 }
 
-/// Parses a single property: `key=value`. Returns the Rust struct.
-fn parse_property<'a>(input: Input<'a>) -> ParserResult<'a, Property> {
-    // Wrap the entire combinator chain with context
+fn parse_property_internal<'a>(input: Input<'a>) -> ParserResult<'a, Property> {
     context(
-        "key=value property",
-        // Use map combinator function
+        "property",
         map(
             separated_pair(
-                parse_identifier,      // The key (e.g., "color")
-                tuple((ws, nom_char('='), ws)), // The separator ("=")
-                parse_property_value   // The value (e.g., "red")
+                parse_identifier_str,
+                tuple((ws, nom_char('='), ws)),
+                parse_property_value_str
             ),
-            |(key_str, value_str)| Property { // Convert the parsed strings into a Property struct
-                key: key_str.to_string(),
-                value: value_str.to_string(),
-            }
+            |(k, v)| Property { key: k.to_string(), value: v.to_string() }
         )
     )(input)
 }
 
-
-/// Parses the optional properties/comment part after a shape definition. Returns Vec<Property>.
-fn parse_optional_properties<'a>(input: Input<'a>) -> ParserResult<'a, Vec<Property>> {
-    // Wrap the entire combinator chain with context
+fn parse_optional_properties_internal<'a>(input: Input<'a>) -> ParserResult<'a, Vec<Property>> {
     context(
-        "optional properties section starting with #",
-        // Use map combinator function
-        map( // Map the Option<Vec> to Vec
+        "optional properties",
+        map(
             opt(
-                // `preceded` ensures '#' and at least one whitespace character are present
                 preceded(
-                    context("property marker '#' followed by space", tuple((ws, nom_char('#'), ws1))),
-                    // `separated_list0` parses zero or more items separated by whitespace.
-                    context(
-                        "list of properties",
-                        separated_list0(
-                            ws1, // Separator is one or more whitespace
-                            parse_property // Item parser returns Rust Property struct
-                        )
-                    )
+                    context("property marker '#'", tuple((ws, nom_char('#'), ws1))),
+                    nom::multi::separated_list0(ws1, parse_property_internal)
                 )
             ),
-            // If `opt` returned `None` (no '#' section), provide an empty Vec.
-            // Otherwise, unwrap the `Some(Vec<Property>)`.
             |opt_props| opt_props.unwrap_or_else(Vec::new)
         )
     )(input)
 }
 
-// --- Shape Parser ---
+// --- Shape Definition Logic ---
 
-/// Parses a full shape definition line (e.g., "circle(10, 20, 5) # color=red").
-/// Returns IResult containing the remaining input and the parsed Rust Shape struct data.
-pub fn parse_shape_definition<'a>(input: Input<'a>) -> ParserResult<'a, (ShapeType, Vec<f64>, Vec<Property>)> {
-    // Wrap the entire combinator chain with context
+/// Returns the expected coordinate signature for a given shape name.
+/// Based on the Python ds9_shape_defs and user clarification.
+fn get_shape_signature(shape_name_lc: &str) -> Option<ShapeSignature> {
+    use SemanticCoordType::*;
+    // Helper to quickly define static slices
+    macro_rules! sct_slice { ($($x:expr),* $(,)?) => { &[$($x),*] } }
+
+    match shape_name_lc {
+        "circle" => Some(ShapeSignature {
+            name: "circle",
+            fixed_head: sct_slice![CoordOdd, CoordEven, Distance],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "ellipse" => Some(ShapeSignature {
+            name: "ellipse",
+            fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Distance, Angle],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "box" | "rotbox" => Some(ShapeSignature {
+            name: if shape_name_lc == "box" { "box" } else { "rotbox" },
+            fixed_head: sct_slice![CoordOdd, CoordEven],
+            repeat_unit: Some(sct_slice![Distance, Distance]),
+            min_repeats: 1,
+            max_repeats: Some(1),
+            fixed_tail: sct_slice![Angle],
+        }),
+        "polygon" => Some(ShapeSignature {
+            name: "polygon",
+            fixed_head: sct_slice![],
+            repeat_unit: Some(sct_slice![CoordOdd, CoordEven]),
+            min_repeats: 3,
+            max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "point" => Some(ShapeSignature {
+            name: "point",
+            fixed_head: sct_slice![CoordOdd, CoordEven],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "line" => Some(ShapeSignature {
+            name: "line",
+            fixed_head: sct_slice![CoordOdd, CoordEven, CoordOdd, CoordEven],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "annulus" => Some(ShapeSignature {
+            name: "annulus",
+            fixed_head: sct_slice![CoordOdd, CoordEven],
+            repeat_unit: Some(sct_slice![Distance]),
+            min_repeats: 1,
+            max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "pie" => Some(ShapeSignature {
+            name: "pie",
+            fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Distance, Angle, Angle],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "vector" => Some(ShapeSignature {
+            name: "vector",
+            fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Angle],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "text" => Some(ShapeSignature {
+            name: "text",
+            fixed_head: sct_slice![CoordOdd, CoordEven],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "panda" => Some(ShapeSignature {
+            name: "panda",
+            fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Integer],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        "epanda" | "bpanda" => Some(ShapeSignature {
+            name: if shape_name_lc == "epanda" { "epanda" } else { "bpanda" },
+            fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Distance, Distance, Integer, Angle],
+            repeat_unit: None, min_repeats: 0, max_repeats: None,
+            fixed_tail: sct_slice![],
+        }),
+        _ => None,
+    }
+}
+
+
+// --- Shape Parser (Rust internal result) ---
+// Returns (ShapeType enum, Vec<f64>, Vec<Property>)
+fn parse_shape_definition_internal<'a>(input: Input<'a>) -> ParserResult<'a, (ShapeType, Vec<f64>, Vec<Property>)> {
     context(
-        "shape definition",
-        // Use map combinator function correctly
-        map(
+        "shape_definition_internal",
+        // Use map_res to allow the mapping function to return a Result
+        map_res(
             tuple((
-                parse_identifier, // 1. Shape keyword
-                parse_coordinates, // 2. Coordinates
-                parse_optional_properties // 3. Optional properties after '#'
+                parse_identifier_str,
+                parse_coordinates_list_f64,
+                parse_optional_properties_internal,
             )),
-            // Map the result tuple into our internal representation
-            |(shape_keyword, coords, props)| {
-                let shape_type = match shape_keyword.to_lowercase().as_str() {
-                    "circle" => ShapeType::Circle,
-                    "ellipse" => ShapeType::Ellipse,
-                    "box" => ShapeType::Box,
-                    "polygon" => ShapeType::Polygon,
-                    "point" => ShapeType::Point,
-                    "line" => ShapeType::Line,
+            // This closure now returns Result<(ShapeType, Vec<f64>, Vec<Property>), nom::Err<NomVerboseError<'a>>>
+            |(shape_keyword, coords, props): (&str, Vec<f64>, Vec<Property>)| {
+                let shape_keyword_lc = shape_keyword.to_lowercase();
+                let shape_type_enum = match shape_keyword_lc.as_str() {
+                    "circle" => ShapeType::Circle, "ellipse" => ShapeType::Ellipse,
+                    "box" => ShapeType::Box, "rotbox" => ShapeType::RotBox,
+                    "polygon" => ShapeType::Polygon, "point" => ShapeType::Point,
+                    "line" => ShapeType::Line, "annulus" => ShapeType::Annulus,
+                    "pie" => ShapeType::Pie, "panda" => ShapeType::Panda,
+                    "epanda" => ShapeType::Epanda, "bpanda" => ShapeType::Bpanda,
+                    "vector" => ShapeType::Vector, "text" => ShapeType::Text,
                     _ => ShapeType::Unsupported(shape_keyword.to_string()),
                 };
-                (shape_type, coords, props)
+
+                if let ShapeType::Unsupported(_) = shape_type_enum {
+                    return Ok((shape_type_enum, coords, props));
+                }
+
+                let error_input_ref = input; // Use the original input for error location context
+
+                if let Some(signature) = get_shape_signature(&shape_keyword_lc) {
+                    let n_coords = coords.len();
+                    let len_fixed_head = signature.fixed_head.len();
+                    let len_fixed_tail = signature.fixed_tail.len();
+                    let min_required_for_fixed = len_fixed_head + len_fixed_tail;
+
+                    if n_coords < min_required_for_fixed {
+                        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
+                        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (fixed parts)", base_err);
+                        return Err(nom::Err::Error(ctx_err));
+                    }
+
+                    if let Some(repeat_unit_slice) = signature.repeat_unit {
+                        let len_repeat_unit = repeat_unit_slice.len();
+                        if len_repeat_unit == 0 {
+                            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
+                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (invalid signature: repeat unit empty)", base_err);
+                            return Err(nom::Err::Error(ctx_err));
+                        }
+
+                        let n_repeating_coords = n_coords - min_required_for_fixed;
+
+                        if n_repeating_coords < signature.min_repeats * len_repeat_unit {
+                             let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
+                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (min repeats)", base_err);
+                            return Err(nom::Err::Error(ctx_err));
+                        }
+
+                        if n_repeating_coords % len_repeat_unit != 0 {
+                            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
+                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (repeat alignment)", base_err);
+                            return Err(nom::Err::Error(ctx_err));
+                        }
+
+                        let num_repeats = n_repeating_coords / len_repeat_unit;
+                        if let Some(max_r) = signature.max_repeats {
+                            if num_repeats > max_r {
+                                let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
+                                let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (max repeats)", base_err);
+                                return Err(nom::Err::Error(ctx_err));
+                            }
+                        }
+                    } else { // No repeating part defined
+                        if n_coords != min_required_for_fixed {
+                            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
+                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (exact fixed)", base_err);
+                            return Err(nom::Err::Error(ctx_err));
+                        }
+                    }
+                } else {
+                    let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
+                    let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "internal signature missing", base_err);
+                    return Err(nom::Err::Error(ctx_err));
+                }
+                Ok((shape_type_enum, coords, props))
             }
         )
     )(input)
 }
 
-
-// --- Main Parsing Function (Internal Rust) ---
-
-/// Parses a single line expected to contain a region shape definition.
-/// Handles leading/trailing whitespace and ensures the entire line is consumed.
-/// Returns Result<(ShapeType, Vec<f64>, Vec<Property>), String>
-pub fn parse_single_region_line_internal(line: &str) -> Result<(ShapeType, Vec<f64>, Vec<Property>), String> {
-    // Define the full line parser: optional whitespace, shape definition, optional whitespace, end of input
-    let mut parser = terminated(
-        preceded(ws, parse_shape_definition), // parse_shape_definition returns the tuple
-        ws // Consume trailing whitespace before checking eof implicitly with finish
-    );
-
-    match parser(line).finish() {
-        Ok((_remaining_input, (shape_type, coords, props))) => {
-             Ok((shape_type, coords, props))
-        },
-        Err(e) => {
-            Err(nom::error::convert_error(line, e))
-        }
+// --- Main Parsing Function (for Rust usage, returns Result) ---
+pub fn parse_single_region_line_for_rust(line: &str) -> Result<(ShapeType, Vec<f64>, Vec<Property>), String> {
+    match terminated(preceded(ws, parse_shape_definition_internal), ws)(line).finish() {
+        Ok((_remaining, output)) => Ok(output),
+        Err(e) => Err(nom::error::convert_error(line, e)),
     }
 }
 
 // --- Python Function ---
-
-/// Parses a single region line string and returns a Shape object.
-/// Raises ValueError on parsing failure.
 #[pyfunction]
 fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<Py<Shape>> {
-    match parse_single_region_line_internal(line) {
-        Ok((shape_type, coords, props_rust)) => {
-            // Create the Python Shape object using its #[new] constructor
-            // Pass the necessary arguments that can be converted from Rust types
+    match parse_single_region_line_for_rust(line) {
+        Ok((shape_type_rust, coords_rust, props_rust)) => {
+            let props_py: Vec<Py<Property>> = props_rust
+                .into_iter()
+                .map(|p_rust| Py::new(py, p_rust))
+                .collect::<PyResult<_>>()?;
+
             let shape_obj = Shape::new(
-                py, // Pass Python context
-                shape_type.to_string_py(), // Convert enum to string
-                coords,
-                props_rust // Pass the Vec<Property> directly
-            )?;
-            // Wrap the created Rust struct instance in Py<>
-            Ok(Py::new(py, shape_obj)?)
+                shape_type_rust.to_string_py(),
+                coords_rust,
+                props_py,
+            );
+            Py::new(py, shape_obj)
         }
-        Err(e_str) => {
-            // Convert the Rust error string into a Python ValueError
-            Err(PyValueError::new_err(e_str))
-        }
+        Err(e_str) => Err(PyValueError::new_err(e_str)),
     }
 }
 
-
 // --- Python Module Definition ---
-
-/// A Python module implemented in Rust for parsing DS9 region files.
 #[pymodule]
 fn rusty_region_parser(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_region_line, m)?)?;
@@ -376,29 +404,27 @@ fn rusty_region_parser(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     Ok(())
 }
 
-
-// --- Unit Tests (Rust tests remain unchanged) ---
+// --- Unit Tests (Rust tests) ---
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Test the internal Rust function directly
-     macro_rules! assert_internal_parses {
-        ($input:expr, $expected_type:pat, $expected_coords:expr, $expected_props_len:expr) => {
-            match parse_single_region_line_internal($input) {
+     macro_rules! assert_rust_parses {
+        ($input:expr, $expected_type:pat, $expected_coords_len:expr, $expected_props_len:expr) => {
+            match parse_single_region_line_for_rust($input) {
                 Ok((shape_type, coords, props)) => {
-                    assert!(matches!(shape_type, $expected_type), "Shape type mismatch");
-                    assert_eq!(coords, $expected_coords, "Coordinate mismatch");
-                    assert_eq!(props.len(), $expected_props_len, "Property count mismatch");
+                    assert!(matches!(shape_type, $expected_type), "Shape type mismatch. Got: {:?}", shape_type);
+                    assert_eq!(coords.len(), $expected_coords_len, "Coordinate count mismatch for '{}'. Got: {:?}, expected {}", $input, coords, $expected_coords_len);
+                    assert_eq!(props.len(), $expected_props_len, "Property count mismatch for '{}'. Got: {:?}, expected {}", $input, props, $expected_props_len);
                 },
                 Err(e_str) => panic!("Internal parsing failed for '{}':\n{}", $input, e_str),
             }
         };
     }
 
-     macro_rules! assert_internal_fails {
+     macro_rules! assert_rust_fails {
         ($input:expr) => {
-            let result = parse_single_region_line_internal($input);
+            let result = parse_single_region_line_for_rust($input);
              if result.is_ok() {
                  panic!("Internal parsing should have failed for '{}' but succeeded with: {:?}", $input, result.unwrap());
              }
@@ -406,26 +432,69 @@ mod tests {
         };
     }
 
+    #[test]
+    fn test_rust_parse_simple_circle() {
+        let line = "circle(100, 200, 30)";
+        assert_rust_parses!(line, ShapeType::Circle, 3, 0);
+    }
 
     #[test]
-    fn test_internal_parse_simple_circle() {
-        let line = "circle(100, 200, 30)";
-        assert_internal_parses!(line, ShapeType::Circle, vec![100.0, 200.0, 30.0], 0);
+    fn test_rust_parse_polygon_valid() {
+        let line = "polygon(1,2,3,4,5,6)"; // 3 pairs
+        assert_rust_parses!(line, ShapeType::Polygon, 6, 0);
+        let line2 = "polygon(1,2,3,4,5,6,7,8)"; // 4 pairs
+        assert_rust_parses!(line2, ShapeType::Polygon, 8, 0);
     }
 
+    #[test]
+    fn test_rust_parse_polygon_invalid_count() {
+        let line_too_few = "polygon(1,2,3,4)"; // 2 pairs, less than min 3 pairs (6 coords)
+        assert_rust_fails!(line_too_few);
+
+        let line_misaligned = "polygon(1,2,3,4,5,6,7)"; // 7 coords, not pairs
+        assert_rust_fails!(line_misaligned);
+    }
+
+    #[test]
+    fn test_rust_parse_box_valid() {
+        let line = "box(1,2,10,20,0)";
+        assert_rust_parses!(line, ShapeType::Box, 5,0);
+    }
      #[test]
-    fn test_internal_parse_circle_with_whitespace() {
+    fn test_rust_parse_rotbox_valid() {
+        let line = "rotbox(1,2,10,20,30)";
+        assert_rust_parses!(line, ShapeType::RotBox, 5,0);
+    }
+
+
+    #[test]
+    fn test_rust_parse_annulus_valid() {
+        let line_3_params = "annulus(1,2,10)"; // x,y,r_inner
+        assert_rust_parses!(line_3_params, ShapeType::Annulus, 3, 0);
+        let line_4_params = "annulus(1,2,10,20)"; // x,y,r_inner, r_outer1
+        assert_rust_parses!(line_4_params, ShapeType::Annulus, 4, 0);
+        let line_5_params = "annulus(1,2,10,20,30)"; // x,y,r_inner, r_outer1, r_outer2
+        assert_rust_parses!(line_5_params, ShapeType::Annulus, 5, 0);
+    }
+
+    #[test]
+    fn test_rust_parse_annulus_invalid() {
+        let line_too_few = "annulus(1,2)"; // Needs at least x,y,r_inner
+        assert_rust_fails!(line_too_few);
+    }
+
+
+    #[test]
+    fn test_rust_parse_circle_with_whitespace() {
         let line = "  circle  ( 100.5 ,  200 , 30 )   ";
-        assert_internal_parses!(line, ShapeType::Circle, vec![100.5, 200.0, 30.0], 0);
+        assert_rust_parses!(line, ShapeType::Circle, 3, 0);
     }
 
-
-     #[test]
-    fn test_internal_parse_circle_with_properties() {
+    #[test]
+    fn test_rust_parse_circle_with_properties() {
         let line = "circle( 10.5, 20 , 5.0 ) # color=red width=2 tag=foo";
-         assert_internal_parses!(line, ShapeType::Circle, vec![10.5, 20.0, 5.0], 3);
-         // Could add more detailed property checks here if needed
-         match parse_single_region_line_internal(line) {
+        assert_rust_parses!(line, ShapeType::Circle, 3, 3);
+         match parse_single_region_line_for_rust(line) {
              Ok((_, _, props)) => {
                  assert_eq!(props[0], Property { key: "color".to_string(), value: "red".to_string() });
                  assert_eq!(props[1], Property { key: "width".to_string(), value: "2".to_string() });
@@ -435,32 +504,33 @@ mod tests {
          }
     }
 
-      #[test]
-    fn test_internal_parse_ellipse() {
+    #[test]
+    fn test_rust_parse_ellipse() {
         let line = "ellipse(500, 500, 20.1, 10.9, 45)";
-        assert_internal_parses!(line, ShapeType::Ellipse, vec![500.0, 500.0, 20.1, 10.9, 45.0], 0);
+        assert_rust_parses!(line, ShapeType::Ellipse, 5, 0);
     }
 
-      #[test]
-    fn test_internal_invalid_syntax_missing_coord() {
+    #[test]
+    fn test_rust_invalid_syntax_missing_coord() {
         let line = "circle(100, 200, )";
-        assert_internal_fails!(line);
+        assert_rust_fails!(line);
     }
 
-      #[test]
-    fn test_internal_invalid_syntax_unclosed_paren() {
+    #[test]
+    fn test_rust_invalid_syntax_unclosed_paren() {
         let line = "circle(100, 200, 30";
-        assert_internal_fails!(line);
+        assert_rust_fails!(line);
     }
 
-      #[test]
-    fn test_internal_unsupported_shape() {
-        let line = "vector(1, 2, 10, 0) # property=value";
-         assert_internal_parses!(line, ShapeType::Unsupported(_), vec![1.0, 2.0, 10.0, 0.0], 1);
-         match parse_single_region_line_internal(line) {
+    #[test]
+    fn test_rust_unsupported_shape_name() {
+        let line = "someunknownshape(1, 2, 10, 0) # property=value";
+        // This will be parsed as ShapeType::Unsupported
+        assert_rust_parses!(line, ShapeType::Unsupported(_), 4, 1);
+         match parse_single_region_line_for_rust(line) {
              Ok((shape_type, _, props)) => {
                  match shape_type {
-                     ShapeType::Unsupported(s) => assert!(s.eq_ignore_ascii_case("vector")),
+                     ShapeType::Unsupported(s) => assert!(s.eq_ignore_ascii_case("someunknownshape")),
                      _ => panic!("Expected Unsupported shape type"),
                  }
                  assert_eq!(props[0], Property { key: "property".to_string(), value: "value".to_string() });
@@ -468,5 +538,11 @@ mod tests {
              _ => panic!("Should have parsed successfully"),
          }
     }
+     #[test]
+    fn test_rust_vector_shape_defined() {
+        let line = "vector(1,2,3,4)";
+        assert_rust_parses!(line, ShapeType::Vector, 4,0);
+    }
+
 
 }
