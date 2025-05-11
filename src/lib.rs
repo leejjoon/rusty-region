@@ -13,15 +13,16 @@ use nom::{
     IResult,
     character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char},
     bytes::complete::take_while1,
-    combinator::{map, map_res, opt}, // Added map_res
-    sequence::{preceded, terminated, separated_pair, tuple},
-    multi::{separated_list0, separated_list1},
+    combinator::{map, opt, value}, // Added back value, removed map_res, success
+    sequence::{preceded, terminated, separated_pair, tuple}, // Removed pair
+    // Removed separated_list0, separated_list1, many_m_n as they are used with nom::multi::
     number::complete::double,
-    error::{VerboseError, context, ParseError as NomParseErrorTrait, ContextError}, // Added ContextError trait
+    error::{VerboseError, context, ParseError as NomParseErrorTrait, ContextError},
     Finish,
-    Parser,
+    // Parser, // Removed unused Parser trait import
 };
-use std::collections::HashMap; // For storing shape definitions
+// Removed unused HashMap
+// use std::collections::HashMap;
 
 // --- Custom Error Type for Nom ---
 type NomVerboseError<'a> = VerboseError<&'a str>;
@@ -123,30 +124,171 @@ type ParserResult<'a, O> = IResult<Input<'a>, O, NomVerboseError<'a>>;
 fn ws<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { multispace0(input) }
 fn ws1<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { multispace1(input) }
 
-fn parse_f64<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    context("floating point number", preceded(ws, terminated(double, ws)))(input)
+fn parse_f64_raw<'a>(input: Input<'a>) -> ParserResult<'a, f64> { // Renamed to avoid conflict
+    double(input)
+}
+
+fn parse_f64_with_ws<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
+    context("floating point number", preceded(ws, terminated(parse_f64_raw, ws)))(input)
 }
 
 fn parse_identifier_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
     context("identifier", preceded(ws, terminated(alphanumeric1, ws)))(input)
 }
 
-// --- Component Parsers ---
-fn parse_coordinates_list_f64<'a>(input: Input<'a>) -> ParserResult<'a, Vec<f64>> {
-    context(
-        "coordinate list",
-        preceded(
-            context("opening parenthesis", tuple((ws, nom_char('(')))),
-            terminated(
-                nom::multi::separated_list1(
-                    context("coordinate separator comma", tuple((ws, nom_char(','), ws))),
-                    parse_f64
-                ),
-                context("closing parenthesis", tuple((ws, nom_char(')'))))
-            )
-        )
-    )(input)
+// --- Semantic Coordinate Parsers (all parse f64 for now) ---
+fn parse_coord_odd<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
+    context("CoordOdd", parse_f64_with_ws)(input)
 }
+fn parse_coord_even<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
+    context("CoordEven", parse_f64_with_ws)(input)
+}
+fn parse_distance<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
+    context("Distance", parse_f64_with_ws)(input)
+}
+fn parse_angle<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
+    context("Angle", parse_f64_with_ws)(input)
+}
+fn parse_integer_as_f64<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
+    context("Integer (as f64)", parse_f64_with_ws)(input)
+}
+
+/// Dispatches to the correct semantic parser.
+fn dispatch_semantic_parser(semantic_type: SemanticCoordType) -> impl FnMut(Input) -> ParserResult<f64> {
+    move |i: Input| {
+        match semantic_type {
+            SemanticCoordType::CoordOdd => parse_coord_odd(i),
+            SemanticCoordType::CoordEven => parse_coord_even(i),
+            SemanticCoordType::Distance => parse_distance(i),
+            SemanticCoordType::Angle => parse_angle(i),
+            SemanticCoordType::Integer => parse_integer_as_f64(i),
+        }
+    }
+}
+
+// --- Component Parsers ---
+
+/// Parses a comma separator with surrounding whitespace.
+fn comma_sep<'a>(input: Input<'a>) -> ParserResult<'a, ()> {
+    value((), tuple((ws, nom_char(','), ws)))(input) // Added `value` import
+}
+
+/// Parses a sequence of coordinates based on the provided semantic types,
+/// handling commas between them.
+fn parse_semantic_sequence<'a>(
+    param_types: &'static [SemanticCoordType],
+) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> {
+    move |mut i: Input| {
+        let mut coords = Vec::with_capacity(param_types.len());
+        if param_types.is_empty() {
+            return Ok((i, coords));
+        }
+
+        // Parse the first element
+        let (next_i, val) = dispatch_semantic_parser(param_types[0])(i)?;
+        coords.push(val);
+        i = next_i;
+
+        // Parse subsequent elements, each preceded by a comma
+        for &semantic_type in param_types.iter().skip(1) {
+            let (next_i_comma, _) = comma_sep(i)?;
+            let (next_i_val, val) = dispatch_semantic_parser(semantic_type)(next_i_comma)?;
+            coords.push(val);
+            i = next_i_val;
+        }
+        Ok((i, coords))
+    }
+}
+
+
+/// Parses coordinates dynamically based on the shape signature.
+/// This parser is for the content *inside* the parentheses `(...)`.
+fn parse_coordinates_by_signature<'a>(
+    signature: &'static ShapeSignature, // Expecting a static reference
+) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> {
+    move |mut i: Input| {
+        let mut all_coords = Vec::new();
+        let original_input_for_error_reporting = i; // For context on structural errors
+
+        // 1. Parse Fixed Head
+        if !signature.fixed_head.is_empty() {
+            let (next_i, head_coords) = parse_semantic_sequence(signature.fixed_head)(i)?;
+            all_coords.extend(head_coords);
+            i = next_i;
+        }
+
+        // 2. Parse Repeating Unit
+        let mut actual_repeats = 0;
+        if let Some(repeat_unit_def) = signature.repeat_unit {
+            if !repeat_unit_def.is_empty() {
+                // Parse minimum required repeats
+                for _ in 0..signature.min_repeats {
+                    if !all_coords.is_empty() {
+                        let (next_i, _) = comma_sep(i)?;
+                        i = next_i;
+                    }
+                    let (next_i, unit_coords) = parse_semantic_sequence(repeat_unit_def)(i)?;
+                    all_coords.extend(unit_coords);
+                    i = next_i;
+                    actual_repeats += 1;
+                }
+
+                let max_additional_repeats = signature.max_repeats.map_or(usize::MAX, |max_r| {
+                    if max_r >= signature.min_repeats { max_r - signature.min_repeats } else { 0 }
+                });
+
+                for _ in 0..max_additional_repeats {
+                    let mut temp_i = i;
+                    if !all_coords.is_empty() {
+                        match comma_sep(temp_i) {
+                            Ok((next_i, _)) => temp_i = next_i,
+                            Err(_) => break, 
+                        }
+                    }
+                    match parse_semantic_sequence(repeat_unit_def)(temp_i) {
+                        Ok((next_i, unit_coords)) => {
+                            all_coords.extend(unit_coords);
+                            i = next_i;
+                            actual_repeats += 1;
+                        }
+                        Err(_) => break, 
+                    }
+                }
+            }
+        }
+        
+        if signature.repeat_unit.is_some() {
+            if actual_repeats < signature.min_repeats {
+                return Err(nom::Err::Error(NomVerboseError::add_context(original_input_for_error_reporting, "not enough repeat units", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::ManyMN))));
+            }
+            if let Some(max_r) = signature.max_repeats {
+                if actual_repeats > max_r {
+                     return Err(nom::Err::Error(NomVerboseError::add_context(original_input_for_error_reporting, "too many repeat units", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::ManyMN))));
+                }
+            }
+        }
+
+        // 3. Parse Fixed Tail
+        if !signature.fixed_tail.is_empty() {
+            if !all_coords.is_empty() { 
+                 let (next_i, _) = comma_sep(i)?;
+                 i = next_i;
+            }
+            let (next_i, tail_coords) = parse_semantic_sequence(signature.fixed_tail)(i)?;
+            all_coords.extend(tail_coords);
+            i = next_i;
+        }
+        
+        if all_coords.is_empty() {
+            // This case is valid if fixed_head, repeat_unit (with min_repeats=0), and fixed_tail are all empty.
+            // Example: A polygon signature allowing 0 points.
+            // Our current polygon signature requires min_repeats=3, so it won't hit this for polygon.
+        }
+
+        Ok((i, all_coords))
+    }
+}
+
 
 fn parse_property_value_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
     context("property value", take_while1(|c: char| !c.is_whitespace() && c != '#'))(input)
@@ -182,189 +324,89 @@ fn parse_optional_properties_internal<'a>(input: Input<'a>) -> ParserResult<'a, 
 }
 
 // --- Shape Definition Logic ---
+// Define static ShapeSignature instances
+macro_rules! sct_slice { ($($x:expr),* $(,)?) => { &[$($x),*] } }
+use SemanticCoordType::*;
+
+static CIRCLE_SIG: ShapeSignature = ShapeSignature { name: "circle", fixed_head: sct_slice![CoordOdd, CoordEven, Distance], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![] };
+static ELLIPSE_SIG: ShapeSignature = ShapeSignature { name: "ellipse", fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Distance, Angle], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![] };
+static BOX_SIG: ShapeSignature = ShapeSignature { name: "box", fixed_head: sct_slice![CoordOdd, CoordEven], repeat_unit: Some(sct_slice![Distance, Distance]), min_repeats: 1, max_repeats: Some(1), fixed_tail: sct_slice![Angle] };
+static ROTBOX_SIG: ShapeSignature = ShapeSignature { name: "rotbox", fixed_head: sct_slice![CoordOdd, CoordEven], repeat_unit: Some(sct_slice![Distance, Distance]), min_repeats: 1, max_repeats: Some(1), fixed_tail: sct_slice![Angle] };
+static POLYGON_SIG: ShapeSignature = ShapeSignature { name: "polygon", fixed_head: sct_slice![], repeat_unit: Some(sct_slice![CoordOdd, CoordEven]), min_repeats: 3, max_repeats: None, fixed_tail: sct_slice![] };
+static POINT_SIG: ShapeSignature = ShapeSignature { name: "point", fixed_head: sct_slice![CoordOdd, CoordEven], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![] };
+static LINE_SIG: ShapeSignature = ShapeSignature { name: "line", fixed_head: sct_slice![CoordOdd, CoordEven, CoordOdd, CoordEven], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![] };
+static ANNULUS_SIG: ShapeSignature = ShapeSignature { name: "annulus", fixed_head: sct_slice![CoordOdd, CoordEven], repeat_unit: Some(sct_slice![Distance]), min_repeats: 1, max_repeats: None, fixed_tail: sct_slice![] };
+static PIE_SIG: ShapeSignature = ShapeSignature { name: "pie", fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Distance, Angle, Angle], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![] };
+static VECTOR_SIG: ShapeSignature = ShapeSignature { name: "vector", fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Angle], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![] };
+static TEXT_SIG: ShapeSignature = ShapeSignature { name: "text", fixed_head: sct_slice![CoordOdd, CoordEven], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![] };
+static PANDA_SIG: ShapeSignature = ShapeSignature { name: "panda", fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Integer], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![]};
+static EPANDA_SIG: ShapeSignature = ShapeSignature { name: "epanda", fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Distance, Distance, Integer, Angle], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![]};
+static BPANDA_SIG: ShapeSignature = ShapeSignature { name: "bpanda", fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Distance, Distance, Integer, Angle], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![]};
+
 
 /// Returns the expected coordinate signature for a given shape name.
-/// Based on the Python ds9_shape_defs and user clarification.
-fn get_shape_signature(shape_name_lc: &str) -> Option<ShapeSignature> {
-    use SemanticCoordType::*;
-    // Helper to quickly define static slices
-    macro_rules! sct_slice { ($($x:expr),* $(,)?) => { &[$($x),*] } }
-
+fn get_shape_signature(shape_name_lc: &str) -> Option<&'static ShapeSignature> {
     match shape_name_lc {
-        "circle" => Some(ShapeSignature {
-            name: "circle",
-            fixed_head: sct_slice![CoordOdd, CoordEven, Distance],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "ellipse" => Some(ShapeSignature {
-            name: "ellipse",
-            fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Distance, Angle],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "box" | "rotbox" => Some(ShapeSignature {
-            name: if shape_name_lc == "box" { "box" } else { "rotbox" },
-            fixed_head: sct_slice![CoordOdd, CoordEven],
-            repeat_unit: Some(sct_slice![Distance, Distance]),
-            min_repeats: 1,
-            max_repeats: Some(1),
-            fixed_tail: sct_slice![Angle],
-        }),
-        "polygon" => Some(ShapeSignature {
-            name: "polygon",
-            fixed_head: sct_slice![],
-            repeat_unit: Some(sct_slice![CoordOdd, CoordEven]),
-            min_repeats: 3,
-            max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "point" => Some(ShapeSignature {
-            name: "point",
-            fixed_head: sct_slice![CoordOdd, CoordEven],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "line" => Some(ShapeSignature {
-            name: "line",
-            fixed_head: sct_slice![CoordOdd, CoordEven, CoordOdd, CoordEven],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "annulus" => Some(ShapeSignature {
-            name: "annulus",
-            fixed_head: sct_slice![CoordOdd, CoordEven],
-            repeat_unit: Some(sct_slice![Distance]),
-            min_repeats: 1,
-            max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "pie" => Some(ShapeSignature {
-            name: "pie",
-            fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Distance, Angle, Angle],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "vector" => Some(ShapeSignature {
-            name: "vector",
-            fixed_head: sct_slice![CoordOdd, CoordEven, Distance, Angle],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "text" => Some(ShapeSignature {
-            name: "text",
-            fixed_head: sct_slice![CoordOdd, CoordEven],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "panda" => Some(ShapeSignature {
-            name: "panda",
-            fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Integer],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
-        "epanda" | "bpanda" => Some(ShapeSignature {
-            name: if shape_name_lc == "epanda" { "epanda" } else { "bpanda" },
-            fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Distance, Distance, Integer, Angle],
-            repeat_unit: None, min_repeats: 0, max_repeats: None,
-            fixed_tail: sct_slice![],
-        }),
+        "circle" => Some(&CIRCLE_SIG),
+        "ellipse" => Some(&ELLIPSE_SIG),
+        "box" => Some(&BOX_SIG),
+        "rotbox" => Some(&ROTBOX_SIG),
+        "polygon" => Some(&POLYGON_SIG),
+        "point" => Some(&POINT_SIG),
+        "line" => Some(&LINE_SIG),
+        "annulus" => Some(&ANNULUS_SIG),
+        "pie" => Some(&PIE_SIG),
+        "vector" => Some(&VECTOR_SIG),
+        "text" => Some(&TEXT_SIG),
+        "panda" => Some(&PANDA_SIG),
+        "epanda" => Some(&EPANDA_SIG),
+        "bpanda" => Some(&BPANDA_SIG),
         _ => None,
     }
 }
 
-
 // --- Shape Parser (Rust internal result) ---
-// Returns (ShapeType enum, Vec<f64>, Vec<Property>)
 fn parse_shape_definition_internal<'a>(input: Input<'a>) -> ParserResult<'a, (ShapeType, Vec<f64>, Vec<Property>)> {
-    context(
-        "shape_definition_internal",
-        // Use map_res to allow the mapping function to return a Result
-        map_res(
-            tuple((
-                parse_identifier_str,
-                parse_coordinates_list_f64,
-                parse_optional_properties_internal,
-            )),
-            // This closure now returns Result<(ShapeType, Vec<f64>, Vec<Property>), nom::Err<NomVerboseError<'a>>>
-            |(shape_keyword, coords, props): (&str, Vec<f64>, Vec<Property>)| {
-                let shape_keyword_lc = shape_keyword.to_lowercase();
-                let shape_type_enum = match shape_keyword_lc.as_str() {
-                    "circle" => ShapeType::Circle, "ellipse" => ShapeType::Ellipse,
-                    "box" => ShapeType::Box, "rotbox" => ShapeType::RotBox,
-                    "polygon" => ShapeType::Polygon, "point" => ShapeType::Point,
-                    "line" => ShapeType::Line, "annulus" => ShapeType::Annulus,
-                    "pie" => ShapeType::Pie, "panda" => ShapeType::Panda,
-                    "epanda" => ShapeType::Epanda, "bpanda" => ShapeType::Bpanda,
-                    "vector" => ShapeType::Vector, "text" => ShapeType::Text,
-                    _ => ShapeType::Unsupported(shape_keyword.to_string()),
-                };
+    let (i, shape_keyword) = parse_identifier_str(input)?;
+    let shape_keyword_lc = shape_keyword.to_lowercase();
+    let shape_type_enum = match shape_keyword_lc.as_str() {
+        "circle" => ShapeType::Circle, "ellipse" => ShapeType::Ellipse,
+        "box" => ShapeType::Box, "rotbox" => ShapeType::RotBox,
+        "polygon" => ShapeType::Polygon, "point" => ShapeType::Point,
+        "line" => ShapeType::Line, "annulus" => ShapeType::Annulus,
+        "pie" => ShapeType::Pie, "panda" => ShapeType::Panda,
+        "epanda" => ShapeType::Epanda, "bpanda" => ShapeType::Bpanda,
+        "vector" => ShapeType::Vector, "text" => ShapeType::Text,
+        _ => ShapeType::Unsupported(shape_keyword.to_string()),
+    };
 
-                if let ShapeType::Unsupported(_) = shape_type_enum {
-                    return Ok((shape_type_enum, coords, props));
-                }
+    let (i, coords) = if let ShapeType::Unsupported(_) = shape_type_enum {
+        preceded(
+            context("opening parenthesis for unsupported shape", tuple((ws, nom_char('(')))),
+            terminated(
+                nom::multi::separated_list1(
+                    context("coordinate separator comma", tuple((ws, nom_char(','), ws))),
+                    parse_f64_with_ws
+                ),
+                context("closing parenthesis for unsupported shape", tuple((ws, nom_char(')'))))
+            )
+        )(i)?
+    } else if let Some(signature) = get_shape_signature(&shape_keyword_lc) {
+        preceded(
+            context("opening parenthesis", tuple((ws, nom_char('(')))),
+            terminated(
+                parse_coordinates_by_signature(signature), // Pass the &'static ShapeSignature
+                context("closing parenthesis", tuple((ws, nom_char(')'))))
+            )
+        )(i)?
+    } else {
+        return Err(nom::Err::Error(NomVerboseError::add_context(input, "internal signature missing for known shape", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(input, nom::error::ErrorKind::Verify))));
+    };
 
-                let error_input_ref = input; // Use the original input for error location context
-
-                if let Some(signature) = get_shape_signature(&shape_keyword_lc) {
-                    let n_coords = coords.len();
-                    let len_fixed_head = signature.fixed_head.len();
-                    let len_fixed_tail = signature.fixed_tail.len();
-                    let min_required_for_fixed = len_fixed_head + len_fixed_tail;
-
-                    if n_coords < min_required_for_fixed {
-                        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
-                        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (fixed parts)", base_err);
-                        return Err(nom::Err::Error(ctx_err));
-                    }
-
-                    if let Some(repeat_unit_slice) = signature.repeat_unit {
-                        let len_repeat_unit = repeat_unit_slice.len();
-                        if len_repeat_unit == 0 {
-                            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
-                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (invalid signature: repeat unit empty)", base_err);
-                            return Err(nom::Err::Error(ctx_err));
-                        }
-
-                        let n_repeating_coords = n_coords - min_required_for_fixed;
-
-                        if n_repeating_coords < signature.min_repeats * len_repeat_unit {
-                             let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
-                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (min repeats)", base_err);
-                            return Err(nom::Err::Error(ctx_err));
-                        }
-
-                        if n_repeating_coords % len_repeat_unit != 0 {
-                            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
-                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (repeat alignment)", base_err);
-                            return Err(nom::Err::Error(ctx_err));
-                        }
-
-                        let num_repeats = n_repeating_coords / len_repeat_unit;
-                        if let Some(max_r) = signature.max_repeats {
-                            if num_repeats > max_r {
-                                let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
-                                let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (max repeats)", base_err);
-                                return Err(nom::Err::Error(ctx_err));
-                            }
-                        }
-                    } else { // No repeating part defined
-                        if n_coords != min_required_for_fixed {
-                            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
-                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "coordinate count validation (exact fixed)", base_err);
-                            return Err(nom::Err::Error(ctx_err));
-                        }
-                    }
-                } else {
-                    let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(error_input_ref, nom::error::ErrorKind::Verify);
-                    let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(error_input_ref, "internal signature missing", base_err);
-                    return Err(nom::Err::Error(ctx_err));
-                }
-                Ok((shape_type_enum, coords, props))
-            }
-        )
-    )(input)
+    let (i, props) = parse_optional_properties_internal(i)?;
+    Ok((i, (shape_type_enum, coords, props)))
 }
+
 
 // --- Main Parsing Function (for Rust usage, returns Result) ---
 pub fn parse_single_region_line_for_rust(line: &str) -> Result<(ShapeType, Vec<f64>, Vec<Property>), String> {
