@@ -1,6 +1,7 @@
 import rusty_region_parser # Use the name specified in pyproject.toml or Cargo.toml [lib]
 
 line1 = "circle(100, 200, 30)"
+line1 = "polygon(100, 200, 30, 30, 40, 40, 50, 50, 20, 20)"
 line2 = "ellipse( 500, 500, 20, 10, 45 ) # color=red tag={cluster 1}"
 line3 = "invalid line("
 

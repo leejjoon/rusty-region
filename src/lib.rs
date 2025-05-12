@@ -13,16 +13,19 @@ use nom::{
     IResult,
     character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char},
     bytes::complete::take_while1,
-    combinator::{map, opt, value}, // Added back value, removed map_res, success
-    sequence::{preceded, terminated, separated_pair, tuple}, // Removed pair
-    // Removed separated_list0, separated_list1, many_m_n as they are used with nom::multi::
+    combinator::{map, map_res, opt, value}, 
+    sequence::{preceded, terminated, separated_pair, tuple}, 
     number::complete::double,
-    error::{VerboseError, context, ParseError as NomParseErrorTrait, ContextError},
+    error::{VerboseError, context, ParseError as NomParseErrorTrait, ContextError}, // Added ContextError trait
     Finish,
-    // Parser, // Removed unused Parser trait import
+    Parser,
 };
-// Removed unused HashMap
-// use std::collections::HashMap;
+use std::collections::HashMap; // For storing shape definitions
+
+// --- Module Declaration ---
+mod semantic_parsers; // Declare the new module
+use semantic_parsers::*; // Bring functions into scope
+
 
 // --- Custom Error Type for Nom ---
 type NomVerboseError<'a> = VerboseError<&'a str>;
@@ -121,56 +124,23 @@ type Input<'a> = &'a str;
 type ParserResult<'a, O> = IResult<Input<'a>, O, NomVerboseError<'a>>;
 
 // --- Basic Parsers ---
-fn ws<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { multispace0(input) }
+pub(crate) fn ws<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { multispace0(input) } // Made pub(crate)
 fn ws1<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { multispace1(input) }
 
-fn parse_f64_raw<'a>(input: Input<'a>) -> ParserResult<'a, f64> { // Renamed to avoid conflict
+// This function is needed by semantic_parsers.rs
+pub(crate) fn parse_f64_raw<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
     double(input)
-}
-
-fn parse_f64_with_ws<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    context("floating point number", preceded(ws, terminated(parse_f64_raw, ws)))(input)
 }
 
 fn parse_identifier_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
     context("identifier", preceded(ws, terminated(alphanumeric1, ws)))(input)
 }
 
-// --- Semantic Coordinate Parsers (all parse f64 for now) ---
-fn parse_coord_odd<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    context("CoordOdd", parse_f64_with_ws)(input)
-}
-fn parse_coord_even<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    context("CoordEven", parse_f64_with_ws)(input)
-}
-fn parse_distance<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    context("Distance", parse_f64_with_ws)(input)
-}
-fn parse_angle<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    context("Angle", parse_f64_with_ws)(input)
-}
-fn parse_integer_as_f64<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    context("Integer (as f64)", parse_f64_with_ws)(input)
-}
-
-/// Dispatches to the correct semantic parser.
-fn dispatch_semantic_parser(semantic_type: SemanticCoordType) -> impl FnMut(Input) -> ParserResult<f64> {
-    move |i: Input| {
-        match semantic_type {
-            SemanticCoordType::CoordOdd => parse_coord_odd(i),
-            SemanticCoordType::CoordEven => parse_coord_even(i),
-            SemanticCoordType::Distance => parse_distance(i),
-            SemanticCoordType::Angle => parse_angle(i),
-            SemanticCoordType::Integer => parse_integer_as_f64(i),
-        }
-    }
-}
-
 // --- Component Parsers ---
 
 /// Parses a comma separator with surrounding whitespace.
 fn comma_sep<'a>(input: Input<'a>) -> ParserResult<'a, ()> {
-    value((), tuple((ws, nom_char(','), ws)))(input) // Added `value` import
+    value((), tuple((ws, nom_char(','), ws)))(input)
 }
 
 /// Parses a sequence of coordinates based on the provided semantic types,
@@ -208,7 +178,7 @@ fn parse_coordinates_by_signature<'a>(
 ) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> {
     move |mut i: Input| {
         let mut all_coords = Vec::new();
-        let original_input_for_error_reporting = i; // For context on structural errors
+        let original_input_for_error_reporting = i; 
 
         // 1. Parse Fixed Head
         if !signature.fixed_head.is_empty() {
@@ -221,7 +191,6 @@ fn parse_coordinates_by_signature<'a>(
         let mut actual_repeats = 0;
         if let Some(repeat_unit_def) = signature.repeat_unit {
             if !repeat_unit_def.is_empty() {
-                // Parse minimum required repeats
                 for _ in 0..signature.min_repeats {
                     if !all_coords.is_empty() {
                         let (next_i, _) = comma_sep(i)?;
@@ -279,11 +248,13 @@ fn parse_coordinates_by_signature<'a>(
             i = next_i;
         }
         
-        if all_coords.is_empty() {
-            // This case is valid if fixed_head, repeat_unit (with min_repeats=0), and fixed_tail are all empty.
-            // Example: A polygon signature allowing 0 points.
-            // Our current polygon signature requires min_repeats=3, so it won't hit this for polygon.
+        if all_coords.is_empty() && signature.fixed_head.is_empty() && signature.fixed_tail.is_empty() && signature.min_repeats == 0 {
+            // This case is valid if the signature allows for zero coordinates.
+        } else if all_coords.is_empty() && ( !signature.fixed_head.is_empty() || !signature.fixed_tail.is_empty() || signature.min_repeats > 0) {
+            // If no coordinates were parsed but some were expected by fixed parts or min_repeats.
+            return Err(nom::Err::Error(NomVerboseError::add_context(original_input_for_error_reporting, "expected coordinates but found none", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::Eof))));
         }
+
 
         Ok((i, all_coords))
     }
@@ -380,13 +351,17 @@ fn parse_shape_definition_internal<'a>(input: Input<'a>) -> ParserResult<'a, (Sh
         _ => ShapeType::Unsupported(shape_keyword.to_string()),
     };
 
+    // `i` is now the input *after* the shape keyword.
+    // The coordinates are enclosed in parentheses.
     let (i, coords) = if let ShapeType::Unsupported(_) = shape_type_enum {
+        // For unsupported shapes, parse coordinates generically as before
         preceded(
             context("opening parenthesis for unsupported shape", tuple((ws, nom_char('(')))),
             terminated(
                 nom::multi::separated_list1(
                     context("coordinate separator comma", tuple((ws, nom_char(','), ws))),
-                    parse_f64_with_ws
+                    // Use the general f64 parser for unsupported shapes
+                    context("f64 for unsupported", preceded(ws, terminated(double, ws)))
                 ),
                 context("closing parenthesis for unsupported shape", tuple((ws, nom_char(')'))))
             )
@@ -400,6 +375,7 @@ fn parse_shape_definition_internal<'a>(input: Input<'a>) -> ParserResult<'a, (Sh
             )
         )(i)?
     } else {
+        // Known shape type string but no signature - internal error
         return Err(nom::Err::Error(NomVerboseError::add_context(input, "internal signature missing for known shape", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(input, nom::error::ErrorKind::Verify))));
     };
 
