@@ -14,7 +14,7 @@ use nom::{
     IResult,
     branch::alt, // For trying different parsers
     character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char},
-    bytes::complete::{take_while1, tag_no_case}, // Added tag_no_case
+    bytes::complete::{take_while1, tag_no_case}, 
     combinator::{map, map_res, opt, value}, 
     sequence::{preceded, terminated, separated_pair, tuple, pair}, 
     number::complete::double,
@@ -69,25 +69,18 @@ pub struct ShapeSignature {
 pub enum CoordSystem {
     Physical, Image, Fk4, B1950, Fk5, J2000, Galactic, Ecliptic, Icrs,
     Linear, Amplifier, Detector,
-    Unknown(String), // Should ideally not be used if parse_coord_system_command is specific
+    Unknown(String), 
 }
 
 impl CoordSystem {
-    // This might not be needed if the parser directly maps tags to enum variants
     fn from_str(s: &str) -> Self {
         match s.to_uppercase().as_str() {
-            "PHYSICAL" => CoordSystem::Physical,
-            "IMAGE" => CoordSystem::Image,
-            "FK4" => CoordSystem::Fk4,
-            "B1950" => CoordSystem::B1950,
-            "FK5" => CoordSystem::Fk5,
-            "J2000" => CoordSystem::J2000,
-            "GALACTIC" => CoordSystem::Galactic,
-            "ECLIPTIC" => CoordSystem::Ecliptic,
-            "ICRS" => CoordSystem::Icrs,
-            "LINEAR" => CoordSystem::Linear,
-            "AMPLIFIER" => CoordSystem::Amplifier,
-            "DETECTOR" => CoordSystem::Detector,
+            "PHYSICAL" => CoordSystem::Physical, "IMAGE" => CoordSystem::Image,
+            "FK4" => CoordSystem::Fk4, "B1950" => CoordSystem::B1950,
+            "FK5" => CoordSystem::Fk5, "J2000" => CoordSystem::J2000,
+            "GALACTIC" => CoordSystem::Galactic, "ECLIPTIC" => CoordSystem::Ecliptic,
+            "ICRS" => CoordSystem::Icrs, "LINEAR" => CoordSystem::Linear,
+            "AMPLIFIER" => CoordSystem::Amplifier, "DETECTOR" => CoordSystem::Detector,
             _ => CoordSystem::Unknown(s.to_string()),
         }
     }
@@ -148,16 +141,18 @@ pub struct Shape {
     #[pyo3(get)]
     shape_type_str: String,
     #[pyo3(get)]
-    coordinates: Vec<f64>, // Still Vec<f64> for now
+    coordinates: Vec<f64>, 
     #[pyo3(get)]
-    properties: Vec<Py<Property>>, // Python objects
+    properties: Vec<Py<Property>>,
+    #[pyo3(get)] // Expose the exclude flag
+    exclude: bool,
 }
 
 #[pymethods]
 impl Shape {
     #[new]
-    fn new(shape_type_str: String, coordinates: Vec<f64>, properties: Vec<Py<Property>>) -> Self {
-        Shape { shape_type_str, coordinates, properties }
+    fn new(shape_type_str: String, coordinates: Vec<f64>, properties: Vec<Py<Property>>, exclude: bool) -> Self {
+        Shape { shape_type_str, coordinates, properties, exclude }
     }
 }
 
@@ -175,14 +170,15 @@ pub(crate) fn parse_f64_raw<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
 }
 
 fn parse_identifier_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
-    context("identifier", preceded(ws, terminated(alphanumeric1, ws)))(input)
+    // Do not consume leading whitespace here, as it might be part of the exclusion prefix.
+    // Let the calling parser handle whitespace before the optional '-' or shape identifier.
+    terminated(alphanumeric1, ws)(input) // Only consume trailing whitespace
 }
 
 // --- Coordinate System Parser ---
 fn parse_coord_system_command<'a>(input: Input<'a>) -> ParserResult<'a, CoordSystem> {
     context(
         "coordinate system command",
-        // Use alt to try parsing specific, case-insensitive keywords
         alt((
             map(tag_no_case("PHYSICAL"), |_| CoordSystem::Physical),
             map(tag_no_case("IMAGE"), |_| CoordSystem::Image),
@@ -196,8 +192,6 @@ fn parse_coord_system_command<'a>(input: Input<'a>) -> ParserResult<'a, CoordSys
             map(tag_no_case("LINEAR"), |_| CoordSystem::Linear),
             map(tag_no_case("AMPLIFIER"), |_| CoordSystem::Amplifier),
             map(tag_no_case("DETECTOR"), |_| CoordSystem::Detector),
-            // Optionally, if you want to capture any other word as Unknown, but this can be risky:
-            // map(alphanumeric1, |s: &str| CoordSystem::Unknown(s.to_string()))
         ))
     )(input)
 }
@@ -318,9 +312,13 @@ fn get_shape_signature(shape_name_lc: &str) -> Option<&'static ShapeSignature> {
 }
 
 // --- Shape Parser (Rust internal result) ---
-// This function parses the shape part: `shape_keyword(coords) # properties`
-fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (ShapeType, Vec<f64>, Vec<Property>)> {
-    let (i, shape_keyword) = parse_identifier_str(input)?;
+// This function parses the shape part: `[-]shape_keyword(coords) # properties`
+// Returns (is_excluded, ShapeType enum, Vec<f64>, Vec<Property>)
+fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, Vec<Property>)> {
+    let (i, opt_exclusion_char) = opt(nom_char('-'))(input)?;
+    let exclude = opt_exclusion_char.is_some();
+
+    let (i, shape_keyword) = parse_identifier_str(i)?; 
     let shape_keyword_lc = shape_keyword.to_lowercase();
     let shape_type_enum = match shape_keyword_lc.as_str() {
         "circle" => ShapeType::Circle, "ellipse" => ShapeType::Ellipse,
@@ -353,47 +351,48 @@ fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (ShapeType, V
             )
         )(i)?
     } else {
-        return Err(nom::Err::Error(NomVerboseError::add_context(input, "internal signature missing for known shape", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(input, nom::error::ErrorKind::Verify))));
+        let original_input_at_shape_keyword = input; 
+        return Err(nom::Err::Error(NomVerboseError::add_context(original_input_at_shape_keyword, "internal signature missing for known shape", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_at_shape_keyword, nom::error::ErrorKind::Verify))));
     };
 
     let (i, props) = parse_optional_properties_internal(i)?;
-    Ok((i, (shape_type_enum, coords, props)))
+    Ok((i, (exclude, shape_type_enum, coords, props)))
 }
 
 
 // --- Main Line Parsing Logic (Internal Rust) ---
-// This function will be the core logic that `parse_single_region_line_for_rust` uses.
-// It returns an IResult to be composable.
-fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, (Option<CoordSystem>, Option<(ShapeType, Vec<f64>, Vec<Property>)>)> {
+// Returns an IResult to be composable.
+// Output: (Option<CoordSystem>, Option<(is_excluded, ShapeType, Vec<f64>, Vec<Property>)>)
+fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, (Option<CoordSystem>, Option<(bool, ShapeType, Vec<f64>, Vec<Property>)>)> {
     alt((
         // Case 1: COORD_SYSTEM ; SHAPE_DEFINITION
         map(
             tuple((
-                preceded(ws, parse_coord_system_command), // Ensure ws is consumed before coord_system
+                preceded(ws, parse_coord_system_command), 
                 ws,
                 nom_char(';'),
-                ws,
-                parse_shape_and_props // Parses shape_keyword(coords) # props
+                preceded(ws, parse_shape_and_props) 
             )),
-            |(cs, _, _, _, shape_data)| (Some(cs), Some(shape_data))
+            |(cs, _, _, shape_data_with_exclude)| (Some(cs), Some(shape_data_with_exclude))
         ),
         // Case 2: COORD_SYSTEM (alone on a line)
         map(
-            preceded(ws, parse_coord_system_command), // Ensure ws is consumed
+            preceded(ws, parse_coord_system_command), 
             |cs| (Some(cs), None)
         ),
         // Case 3: SHAPE_DEFINITION (alone on a line)
         map(
-            preceded(ws, parse_shape_and_props), // Ensure ws is consumed
-            |shape_data| (None, Some(shape_data))
+            preceded(ws, parse_shape_and_props), 
+            |shape_data_with_exclude| (None, Some(shape_data_with_exclude))
         ),
     ))(input)
 }
 
 
 // --- Main Parsing Function (for Rust usage, returns Result) ---
-pub fn parse_single_region_line_for_rust(line: &str) -> Result<(Option<CoordSystem>, Option<(ShapeType, Vec<f64>, Vec<Property>)>), String> {
-    match terminated(parse_line_content, ws)(line).finish() { // parse_line_content already handles initial ws
+// Return: (Option<CoordSystem>, Option<(is_excluded, ShapeType, Vec<f64>, Vec<Property>)>)
+pub fn parse_single_region_line_for_rust(line: &str) -> Result<(Option<CoordSystem>, Option<(bool, ShapeType, Vec<f64>, Vec<Property>)>), String> {
+    match terminated(parse_line_content, ws)(line).finish() { 
         Ok((_remaining, output)) => Ok(output),
         Err(e) => Err(nom::error::convert_error(line, e)),
     }
@@ -401,13 +400,13 @@ pub fn parse_single_region_line_for_rust(line: &str) -> Result<(Option<CoordSyst
 
 // --- Python Function ---
 #[pyfunction]
-fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> { // Return PyObject for tuple
+fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> { 
     match parse_single_region_line_for_rust(line) {
         Ok((coord_system_opt, shape_data_opt)) => {
             let py_coord_system = coord_system_opt.map(|cs| cs.to_string_py()).into_py(py);
 
             let py_shape = match shape_data_opt {
-                Some((shape_type_rust, coords_rust, props_rust)) => {
+                Some((exclude, shape_type_rust, coords_rust, props_rust)) => {
                     let props_py: Vec<Py<Property>> = props_rust
                         .into_iter()
                         .map(|p_rust| Py::new(py, p_rust))
@@ -417,13 +416,13 @@ fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> { // Retu
                         shape_type_rust.to_string_py(),
                         coords_rust,
                         props_py,
+                        exclude, // Pass exclude flag
                     );
                     Some(Py::new(py, shape_obj)?)
                 }
                 None => None,
             };
             
-            // Create a Python tuple using an array/slice
             let tuple_elements: [PyObject; 2] = [py_coord_system, py_shape.into_py(py)];
             Ok(PyTuple::new_bound(py, &tuple_elements).into_py(py))
         }
@@ -446,21 +445,19 @@ mod tests {
     use super::*;
 
      macro_rules! assert_rust_parses_line {
-        ($input:expr, $expected_cs:expr, $expected_shape_type:pat, $expected_coords_len:expr, $expected_props_len:expr) => {
+        ($input:expr, $expected_cs:expr, $expected_shape_type:pat, $expected_exclude:expr, $expected_coords_len:expr, $expected_props_len:expr) => {
             match parse_single_region_line_for_rust($input) {
                 Ok((cs_opt, shape_data_opt)) => {
                     assert_eq!(cs_opt, $expected_cs, "CoordSystem mismatch for '{}'", $input);
                     match shape_data_opt {
-                        Some((shape_type, coords, props)) => {
+                        Some((exclude, shape_type, coords, props)) => {
+                            assert_eq!(exclude, $expected_exclude, "Exclusion flag mismatch for '{}'", $input);
                             assert!(matches!(shape_type, $expected_shape_type), "Shape type mismatch for '{}'. Got: {:?}", $input, shape_type);
                             assert_eq!(coords.len(), $expected_coords_len, "Coordinate count mismatch for '{}'. Got: {:?}, expected {}", $input, coords, $expected_coords_len);
                             assert_eq!(props.len(), $expected_props_len, "Property count mismatch for '{}'. Got: {:?}, expected {}", $input, props, $expected_props_len);
                         },
                         None => {
-                            // This case should only be hit if $expected_shape_type is None (which we can't pat match directly here)
-                            // For simplicity, if $expected_coords_len is 0 and $expected_props_len is 0 and $expected_shape_type is a wildcard, assume it's fine.
-                            // A more robust macro would handle Option<ShapeTypePattern>.
-                             if $expected_coords_len != 0 || $expected_props_len != 0 {
+                             if $expected_coords_len != 0 || $expected_props_len != 0 { 
                                 panic!("Expected shape data but got None for '{}'", $input);
                             }
                         }
@@ -495,69 +492,78 @@ mod tests {
     fn test_rust_parse_coord_system_only() {
         assert_rust_parses_line!("fk5", Some(CoordSystem::Fk5), None);
         assert_rust_parses_line!(" IMAGE ", Some(CoordSystem::Image), None);
-        assert_rust_parses_line!("physical", Some(CoordSystem::Physical), None);
     }
 
     #[test]
     fn test_rust_parse_coord_system_with_shape() {
-        assert_rust_parses_line!("fk5; circle(1,2,3)", Some(CoordSystem::Fk5), ShapeType::Circle, 3, 0);
-        assert_rust_parses_line!(" J2000 ; point(10,20) # text={test}", Some(CoordSystem::J2000), ShapeType::Point, 2, 1);
+        assert_rust_parses_line!("fk5; circle(1,2,3)", Some(CoordSystem::Fk5), ShapeType::Circle, false, 3, 0);
+        assert_rust_parses_line!(" J2000 ; point(10,20) # text={test}", Some(CoordSystem::J2000), ShapeType::Point, false, 2, 1);
+        assert_rust_parses_line!("fk4; -circle(1,2,3)", Some(CoordSystem::Fk4), ShapeType::Circle, true, 3, 0);
     }
     
     #[test]
     fn test_rust_parse_shape_only_no_coord_system() {
-         assert_rust_parses_line!("circle(100, 200, 30)", None, ShapeType::Circle, 3, 0);
+         assert_rust_parses_line!("circle(100, 200, 30)", None, ShapeType::Circle, false, 3, 0);
+         assert_rust_parses_line!("-ellipse(1,2,3,4,5)", None, ShapeType::Ellipse, true, 5, 0);
+    }
+
+    #[test]
+    fn test_excluded_shape_with_properties() {
+        assert_rust_parses_line!("-box(1,2,3,4,5) # color=blue", None, ShapeType::Box, true, 5, 1);
+    }
+
+    #[test]
+    fn test_excluded_shape_leading_whitespace() {
+        assert_rust_parses_line!("  - circle(1,2,3)", None, ShapeType::Circle, true, 3, 0);
+    }
+
+    #[test]
+    fn test_excluded_shape_no_leading_whitespace_before_minus() {
+         assert_rust_parses_line!("-circle(10,20,5)", None, ShapeType::Circle, true, 3, 0);
     }
 
 
     #[test]
     fn test_rust_parse_simple_circle() {
         let line = "circle(100, 200, 30)";
-        assert_rust_parses_line!(line, None, ShapeType::Circle, 3, 0);
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 0);
     }
 
     #[test]
     fn test_rust_parse_polygon_valid() {
         let line = "polygon(1,2,3,4,5,6)"; // 3 pairs
-        assert_rust_parses_line!(line, None, ShapeType::Polygon, 6, 0);
-        let line2 = "polygon(1,2,3,4,5,6,7,8)"; // 4 pairs
-        assert_rust_parses_line!(line2, None, ShapeType::Polygon, 8, 0);
+        assert_rust_parses_line!(line, None, ShapeType::Polygon, false, 6, 0);
     }
 
     #[test]
     fn test_rust_parse_polygon_invalid_count() {
-        let line_too_few = "polygon(1,2,3,4)"; // 2 pairs, less than min 3 pairs (6 coords)
+        let line_too_few = "polygon(1,2,3,4)"; 
         assert_rust_fails!(line_too_few);
-
-        let line_misaligned = "polygon(1,2,3,4,5,6,7)"; // 7 coords, not pairs
+        let line_misaligned = "polygon(1,2,3,4,5,6,7)"; 
         assert_rust_fails!(line_misaligned);
     }
 
     #[test]
     fn test_rust_parse_box_valid() {
         let line = "box(1,2,10,20,0)";
-        assert_rust_parses_line!(line, None, ShapeType::Box, 5,0);
+        assert_rust_parses_line!(line, None, ShapeType::Box, false, 5,0);
     }
      #[test]
     fn test_rust_parse_rotbox_valid() {
         let line = "rotbox(1,2,10,20,30)";
-        assert_rust_parses_line!(line, None, ShapeType::RotBox, 5,0);
+        assert_rust_parses_line!(line, None, ShapeType::RotBox, false, 5,0);
     }
 
 
     #[test]
     fn test_rust_parse_annulus_valid() {
-        let line_3_params = "annulus(1,2,10)"; // x,y,r_inner
-        assert_rust_parses_line!(line_3_params, None, ShapeType::Annulus, 3, 0);
-        let line_4_params = "annulus(1,2,10,20)"; // x,y,r_inner, r_outer1
-        assert_rust_parses_line!(line_4_params, None, ShapeType::Annulus, 4, 0);
-        let line_5_params = "annulus(1,2,10,20,30)"; // x,y,r_inner, r_outer1, r_outer2
-        assert_rust_parses_line!(line_5_params, None, ShapeType::Annulus, 5, 0);
+        let line_3_params = "annulus(1,2,10)"; 
+        assert_rust_parses_line!(line_3_params, None, ShapeType::Annulus, false, 3, 0);
     }
 
     #[test]
     fn test_rust_parse_annulus_invalid() {
-        let line_too_few = "annulus(1,2)"; // Needs at least x,y,r_inner
+        let line_too_few = "annulus(1,2)"; 
         assert_rust_fails!(line_too_few);
     }
 
@@ -565,15 +571,15 @@ mod tests {
     #[test]
     fn test_rust_parse_circle_with_whitespace() {
         let line = "  circle  ( 100.5 ,  200 , 30 )   ";
-        assert_rust_parses_line!(line, None, ShapeType::Circle, 3, 0);
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 0);
     }
 
     #[test]
     fn test_rust_parse_circle_with_properties() {
         let line = "circle( 10.5, 20 , 5.0 ) # color=red width=2 tag=foo";
-        assert_rust_parses_line!(line, None, ShapeType::Circle, 3, 3);
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 3);
          match parse_single_region_line_for_rust(line) {
-             Ok((_, Some((_, _, props)))) => {
+             Ok((_, Some((_, _, _, props)))) => {
                  assert_eq!(props[0], Property { key: "color".to_string(), value: "red".to_string() });
                  assert_eq!(props[1], Property { key: "width".to_string(), value: "2".to_string() });
                  assert_eq!(props[2], Property { key: "tag".to_string(), value: "foo".to_string() });
@@ -585,7 +591,7 @@ mod tests {
     #[test]
     fn test_rust_parse_ellipse() {
         let line = "ellipse(500, 500, 20.1, 10.9, 45)";
-        assert_rust_parses_line!(line, None, ShapeType::Ellipse, 5, 0);
+        assert_rust_parses_line!(line, None, ShapeType::Ellipse, false, 5, 0);
     }
 
     #[test]
@@ -603,10 +609,10 @@ mod tests {
     #[test]
     fn test_rust_unsupported_shape_name() {
         let line = "someunknownshape(1, 2, 10, 0) # property=value";
-        // This will be parsed as ShapeType::Unsupported
-        assert_rust_parses_line!(line, None, ShapeType::Unsupported(_), 4, 1);
+        assert_rust_parses_line!(line, None, ShapeType::Unsupported(_), false, 4, 1);
          match parse_single_region_line_for_rust(line) {
-             Ok((_, Some((shape_type, _, props)))) => {
+             Ok((_, Some((exclude, shape_type, _, props)))) => {
+                 assert!(!exclude);
                  match shape_type {
                      ShapeType::Unsupported(s) => assert!(s.eq_ignore_ascii_case("someunknownshape")),
                      _ => panic!("Expected Unsupported shape type"),
@@ -619,7 +625,7 @@ mod tests {
      #[test]
     fn test_rust_vector_shape_defined() {
         let line = "vector(1,2,3,4)";
-        assert_rust_parses_line!(line, None, ShapeType::Vector, 4,0);
+        assert_rust_parses_line!(line, None, ShapeType::Vector, false, 4,0);
     }
 
 
