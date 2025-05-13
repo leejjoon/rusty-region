@@ -18,7 +18,7 @@ use nom::{
     combinator::{map, map_res, opt, value}, 
     sequence::{preceded, terminated, separated_pair, tuple, pair}, 
     number::complete::double,
-    error::{VerboseError, context, ParseError as NomParseErrorTrait, ContextError},
+    error::{VerboseError, context, ParseError as NomParseErrorTrait, ContextError}, // Added ContextError trait
     Finish,
     Parser,
 };
@@ -61,6 +61,7 @@ pub struct ShapeSignature {
     /// Parameters that appear after all repeating blocks.
     pub fixed_tail: &'static [SemanticCoordType],
 }
+
 
 // --- Data Structures ---
 
@@ -170,9 +171,9 @@ pub(crate) fn parse_f64_raw<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
 }
 
 fn parse_identifier_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
-    // Do not consume leading whitespace here, as it might be part of the exclusion prefix.
-    // Let the calling parser handle whitespace before the optional '-' or shape identifier.
-    terminated(alphanumeric1, ws)(input) // Only consume trailing whitespace
+    // This parser now expects its immediate caller to handle leading whitespace.
+    // It parses the alphanumeric keyword and consumes any trailing whitespace.
+    context("identifier", terminated(alphanumeric1, ws))(input)
 }
 
 // --- Coordinate System Parser ---
@@ -252,8 +253,16 @@ fn parse_coordinates_by_signature<'a>(
             }
         }
         if signature.repeat_unit.is_some() {
-            if actual_repeats < signature.min_repeats { return Err(nom::Err::Error(NomVerboseError::add_context(original_input_for_error_reporting, "not enough repeat units", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::ManyMN)))); }
-            if let Some(max_r) = signature.max_repeats { if actual_repeats > max_r { return Err(nom::Err::Error(NomVerboseError::add_context(original_input_for_error_reporting, "too many repeat units", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::ManyMN)))); } }
+            if actual_repeats < signature.min_repeats { 
+                let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::ManyMN);
+                return Err(nom::Err::Error(<NomVerboseError as ContextError<Input<'a>>>::add_context(original_input_for_error_reporting, "not enough repeat units", base_err)));
+            }
+            if let Some(max_r) = signature.max_repeats { 
+                if actual_repeats > max_r { 
+                    let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::ManyMN);
+                    return Err(nom::Err::Error(<NomVerboseError as ContextError<Input<'a>>>::add_context(original_input_for_error_reporting, "too many repeat units", base_err))); 
+                }
+            }
         }
         if !signature.fixed_tail.is_empty() {
             if !all_coords.is_empty() { let (next_i, _) = comma_sep(i)?; i = next_i; }
@@ -262,7 +271,8 @@ fn parse_coordinates_by_signature<'a>(
         }
         if all_coords.is_empty() && signature.fixed_head.is_empty() && signature.fixed_tail.is_empty() && signature.min_repeats == 0 {} 
         else if all_coords.is_empty() && ( !signature.fixed_head.is_empty() || !signature.fixed_tail.is_empty() || signature.min_repeats > 0) {
-            return Err(nom::Err::Error(NomVerboseError::add_context(original_input_for_error_reporting, "expected coordinates but found none", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::Eof))));
+            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::Eof);
+            return Err(nom::Err::Error(<NomVerboseError as ContextError<Input<'a>>>::add_context(original_input_for_error_reporting, "expected coordinates but found none", base_err)));
         }
         Ok((i, all_coords))
     }
@@ -318,6 +328,9 @@ fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeT
     let (i, opt_exclusion_char) = opt(nom_char('-'))(input)?;
     let exclude = opt_exclusion_char.is_some();
 
+    // Consume any whitespace between the optional '-' and the shape keyword
+    let (i, _) = ws(i)?;
+
     let (i, shape_keyword) = parse_identifier_str(i)?; 
     let shape_keyword_lc = shape_keyword.to_lowercase();
     let shape_type_enum = match shape_keyword_lc.as_str() {
@@ -351,8 +364,13 @@ fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeT
             )
         )(i)?
     } else {
+        // This `input` for error reporting should be `i` before trying to parse coords,
+        // or even `input` to `parse_shape_and_props` if the keyword itself is the issue.
+        // For an internal signature missing, the error is less about current input pos.
         let original_input_at_shape_keyword = input; 
-        return Err(nom::Err::Error(NomVerboseError::add_context(original_input_at_shape_keyword, "internal signature missing for known shape", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_at_shape_keyword, nom::error::ErrorKind::Verify))));
+        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(original_input_at_shape_keyword, nom::error::ErrorKind::Verify);
+        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(original_input_at_shape_keyword, "internal signature missing for known shape", base_err);
+        return Err(nom::Err::Error(ctx_err));
     };
 
     let (i, props) = parse_optional_properties_internal(i)?;
