@@ -14,7 +14,7 @@ use nom::{
     IResult,
     branch::alt, // For trying different parsers
     character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char},
-    bytes::complete::take_while1,
+    bytes::complete::{take_while1, tag_no_case}, // Added tag_no_case
     combinator::{map, map_res, opt, value}, 
     sequence::{preceded, terminated, separated_pair, tuple, pair}, 
     number::complete::double,
@@ -69,10 +69,11 @@ pub struct ShapeSignature {
 pub enum CoordSystem {
     Physical, Image, Fk4, B1950, Fk5, J2000, Galactic, Ecliptic, Icrs,
     Linear, Amplifier, Detector,
-    Unknown(String),
+    Unknown(String), // Should ideally not be used if parse_coord_system_command is specific
 }
 
 impl CoordSystem {
+    // This might not be needed if the parser directly maps tags to enum variants
     fn from_str(s: &str) -> Self {
         match s.to_uppercase().as_str() {
             "PHYSICAL" => CoordSystem::Physical,
@@ -181,10 +182,23 @@ fn parse_identifier_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> {
 fn parse_coord_system_command<'a>(input: Input<'a>) -> ParserResult<'a, CoordSystem> {
     context(
         "coordinate system command",
-        map(
-            alphanumeric1,
-            |s: &str| CoordSystem::from_str(s)
-        )
+        // Use alt to try parsing specific, case-insensitive keywords
+        alt((
+            map(tag_no_case("PHYSICAL"), |_| CoordSystem::Physical),
+            map(tag_no_case("IMAGE"), |_| CoordSystem::Image),
+            map(tag_no_case("FK4"), |_| CoordSystem::Fk4),
+            map(tag_no_case("B1950"), |_| CoordSystem::B1950),
+            map(tag_no_case("FK5"), |_| CoordSystem::Fk5),
+            map(tag_no_case("J2000"), |_| CoordSystem::J2000),
+            map(tag_no_case("GALACTIC"), |_| CoordSystem::Galactic),
+            map(tag_no_case("ECLIPTIC"), |_| CoordSystem::Ecliptic),
+            map(tag_no_case("ICRS"), |_| CoordSystem::Icrs),
+            map(tag_no_case("LINEAR"), |_| CoordSystem::Linear),
+            map(tag_no_case("AMPLIFIER"), |_| CoordSystem::Amplifier),
+            map(tag_no_case("DETECTOR"), |_| CoordSystem::Detector),
+            // Optionally, if you want to capture any other word as Unknown, but this can be risky:
+            // map(alphanumeric1, |s: &str| CoordSystem::Unknown(s.to_string()))
+        ))
     )(input)
 }
 
@@ -355,7 +369,7 @@ fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, (Option<CoordSys
         // Case 1: COORD_SYSTEM ; SHAPE_DEFINITION
         map(
             tuple((
-                parse_coord_system_command,
+                preceded(ws, parse_coord_system_command), // Ensure ws is consumed before coord_system
                 ws,
                 nom_char(';'),
                 ws,
@@ -365,12 +379,12 @@ fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, (Option<CoordSys
         ),
         // Case 2: COORD_SYSTEM (alone on a line)
         map(
-            parse_coord_system_command,
+            preceded(ws, parse_coord_system_command), // Ensure ws is consumed
             |cs| (Some(cs), None)
         ),
         // Case 3: SHAPE_DEFINITION (alone on a line)
         map(
-            parse_shape_and_props, // Parses shape_keyword(coords) # props
+            preceded(ws, parse_shape_and_props), // Ensure ws is consumed
             |shape_data| (None, Some(shape_data))
         ),
     ))(input)
@@ -379,7 +393,7 @@ fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, (Option<CoordSys
 
 // --- Main Parsing Function (for Rust usage, returns Result) ---
 pub fn parse_single_region_line_for_rust(line: &str) -> Result<(Option<CoordSystem>, Option<(ShapeType, Vec<f64>, Vec<Property>)>), String> {
-    match terminated(preceded(ws, parse_line_content), ws)(line).finish() {
+    match terminated(parse_line_content, ws)(line).finish() { // parse_line_content already handles initial ws
         Ok((_remaining, output)) => Ok(output),
         Err(e) => Err(nom::error::convert_error(line, e)),
     }
