@@ -11,14 +11,14 @@ use nom::{
     // Correctly import tag and tag_no_case
     bytes::complete::{tag, tag_no_case}, 
     character::complete::{char as nom_char, digit1, multispace0},
-    combinator::{map, map_res, opt, recognize, value, verify}, // Added verify
+    combinator::{map, map_res, opt, recognize, value, verify}, 
     error::{context, ParseError as NomParseErrorTrait, VerboseError}, // Added VerboseError for tests
     number::complete::double,
     sequence::{delimited, pair, preceded, terminated, tuple},
 };
 use std::str::FromStr;
 // Assumes these are pub(crate) or pub in lib.rs or a shared prelude module
-use crate::{Input, NomVerboseError, ParserResult, SemanticCoordType, ws};
+use crate::{Input, NomVerboseError, ParserResult, SemanticCoordType, ws, CoordSystem};
 
 
 // --- Helper Parsers for Numbers ---
@@ -172,16 +172,19 @@ fn parse_angular_distance_units_format<'a>(input: Input<'a>) -> ParserResult<'a,
 
 // --- Semantic Coordinate Parsers ---
 
-pub(crate) fn parse_coord_odd<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
+pub(crate) fn parse_coord_odd<'a>(active_system: Option<&CoordSystem>, input: Input<'a>) -> ParserResult<'a, f64> {
+    let scale_for_colon_ra = match active_system {
+        Some(CoordSystem::Physical) | Some(CoordSystem::Image) | Some(CoordSystem::Linear) |
+        Some(CoordSystem::Detector) | Some(CoordSystem::Amplifier) | Some(CoordSystem::Unknown(_)) => 1.0,
+        _ => 15.0, // Default to celestial (hours -> degrees) for FK5, J2000, ICRS, Galactic, Ecliptic, or None
+    };
     context(
         "CoordOdd (RA-like)",
         preceded(ws, // Consume leading whitespace for the whole CoordOdd
             terminated( // Consume trailing whitespace after the chosen format
                 alt((
-                    // For RA (hours), scale to degrees
                     parse_sexagesimal_units_format("h", 15.0, "HMS format (e.g., 10h20m30s)"),
-                    // Colon format for RA is also hours, scale to degrees
-                    parse_colon_sexagesimal_format(15.0, "Colon-separated HMS (e.g., 10:20:30.5)"),
+                    parse_colon_sexagesimal_format(scale_for_colon_ra, "Colon-separated HMS"),
                     double // Fallback to simple double (assumed to be degrees already)
                 )),
                 ws
@@ -190,16 +193,16 @@ pub(crate) fn parse_coord_odd<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
     )(input)
 }
 
-pub(crate) fn parse_coord_even<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
+pub(crate) fn parse_coord_even<'a>(active_system: Option<&CoordSystem>, input: Input<'a>) -> ParserResult<'a, f64> {
+    // For Dec, colon format is generally always degrees.
+    let scale_for_colon_dec = 1.0;
     context(
         "CoordEven (Dec-like)",
         preceded(ws,
             terminated(
                 alt((
-                    // For Dec (degrees), scale is 1.0
                     parse_sexagesimal_units_format("d", 1.0, "DMS format (e.g., +10d20m30s)"),
-                    // Colon format for Dec is also degrees, scale is 1.0
-                    parse_colon_sexagesimal_format(1.0, "Colon-separated DMS (e.g., +10:20:30.5)"),
+                    parse_colon_sexagesimal_format(scale_for_colon_dec, "Colon-separated DMS"),
                     double // Fallback to simple double (assumed to be degrees already)
                 )),
                 ws
@@ -214,8 +217,8 @@ pub(crate) fn parse_distance<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
         preceded(ws,
             terminated(
                 alt((
-                    parse_angular_distance_units_format, // e.g., 10.5d, 30", 2.5r (now returns degrees)
-                    double // Fallback to simple double (e.g., for pixel distances)
+                    parse_angular_distance_units_format, 
+                    double 
                 )),
                 ws
             )
@@ -224,22 +227,23 @@ pub(crate) fn parse_distance<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
 }
 
 pub(crate) fn parse_angle<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    // Angles are typically simple numbers (degrees by default in DS9)
     parse_simple_signed_f64_ws(input)
 }
 
 pub(crate) fn parse_integer_as_f64<'a>(input: Input<'a>) -> ParserResult<'a, f64> {
-    // This now uses the updated parse_integer_value_as_f64_ws which verifies no fractional part.
     parse_integer_value_as_f64_ws(input)
 }
 
-/// Dispatches to the correct semantic parser.
-pub(crate) fn dispatch_semantic_parser(semantic_type: SemanticCoordType) -> impl FnMut(Input) -> ParserResult<f64> {
-    move |i: Input| {
+/// Dispatches to the correct semantic parser, passing the active coordinate system.
+pub(crate) fn dispatch_semantic_parser<'a>(
+    semantic_type: SemanticCoordType,
+    active_system: Option<&'a CoordSystem>, // Accept active_system
+) -> impl FnMut(Input<'a>) -> ParserResult<'a, f64> + 'a { // Ensure lifetime 'a is part of the closure
+    move |i: Input<'a>| { // The input 'i' also has lifetime 'a
         match semantic_type {
-            SemanticCoordType::CoordOdd => parse_coord_odd(i),
-            SemanticCoordType::CoordEven => parse_coord_even(i),
-            SemanticCoordType::Distance => parse_distance(i),
+            SemanticCoordType::CoordOdd => parse_coord_odd(active_system, i),
+            SemanticCoordType::CoordEven => parse_coord_even(active_system, i),
+            SemanticCoordType::Distance => parse_distance(i), 
             SemanticCoordType::Angle => parse_angle(i),
             SemanticCoordType::Integer => parse_integer_as_f64(i),
         }
@@ -250,9 +254,8 @@ pub(crate) fn dispatch_semantic_parser(semantic_type: SemanticCoordType) -> impl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nom::Finish; // For converting IResult to Result in tests
+    use nom::Finish; 
 
-    // Helper macro for testing nom parsers
     macro_rules! assert_parser_ok {
         ($parser:expr, $input:expr, $expected_output:expr, $expected_remaining:expr) => {
             match $parser($input) {
@@ -330,31 +333,44 @@ mod tests {
         assert_parser_ok!(parse_angular_distance_units_format, "20.5'", 20.5 / 60.0, "");
         assert_parser_ok!(parse_angular_distance_units_format, "30\"", 30.0 / 3600.0, "");
         assert_parser_ok!(parse_angular_distance_units_format, "1.5r", 1.5_f64.to_degrees(), "");
-        assert_parser_ok!(parse_angular_distance_units_format, "1R", 1.0_f64.to_degrees(), ""); // Test case insensitivity
+        assert_parser_ok!(parse_angular_distance_units_format, "1R", 1.0_f64.to_degrees(), ""); 
     }
 
     #[test]
-    fn test_parse_coord_odd_expects_degrees() {
-        assert_parser_ok!(parse_coord_odd, " 1h ", 15.0, "");
-        assert_parser_ok!(parse_coord_odd, " 2h30m ", 37.5, "");
-        assert_parser_ok!(parse_coord_odd, " 1:0:0 ", 15.0, "");
-        assert_parser_ok!(parse_coord_odd, " 123.45 ", 123.45, "");
+    fn test_parse_coord_odd_celestial_context() {
+        assert_parser_ok!(|i| parse_coord_odd(None, i), " 1:0:0 ", 15.0, "");
+        assert_parser_ok!(|i| parse_coord_odd(Some(&CoordSystem::Fk5), i), " 1:0:0 ", 15.0, "");
+        assert_parser_ok!(|i| parse_coord_odd(Some(&CoordSystem::Image), i), "1h", 15.0, "");
     }
 
     #[test]
-    fn test_parse_coord_even_expects_degrees() {
-        assert_parser_ok!(parse_coord_even, " 10d ", 10.0, "");
-        assert_parser_ok!(parse_coord_even, " +10d30m ", 10.5, "");
-        assert_parser_ok!(parse_coord_even, " -5:15:0 ", -5.25, "");
-        assert_parser_ok!(parse_coord_even, " 45.67 ", 45.67, "");
+    fn test_parse_coord_odd_physical_context() {
+        assert_parser_ok!(|i| parse_coord_odd(Some(&CoordSystem::Image), i), " 10.5 ", 10.5, "");
+        assert_parser_ok!(|i| parse_coord_odd(Some(&CoordSystem::Physical), i), " 10:30 ", 10.5, ""); 
     }
+
+
+    #[test]
+    fn test_parse_coord_even_celestial_context() {
+        assert_parser_ok!(|i| parse_coord_even(None, i), " 10:30:0 ", 10.5, "");
+        assert_parser_ok!(|i| parse_coord_even(Some(&CoordSystem::Fk5), i), " 10:30:0 ", 10.5, "");
+        assert_parser_ok!(|i| parse_coord_even(Some(&CoordSystem::Image), i), "10d", 10.0, "");
+
+    }
+    
+    #[test]
+    fn test_parse_coord_even_physical_context() {
+        assert_parser_ok!(|i| parse_coord_even(Some(&CoordSystem::Image), i), " 10.5 ", 10.5, "");
+        assert_parser_ok!(|i| parse_coord_even(Some(&CoordSystem::Physical), i), " 10:30 ", 10.5, "");
+    }
+
 
     #[test]
     fn test_parse_distance_expects_degrees() {
         assert_parser_ok!(parse_distance, " 10.5d ", 10.5, "");
         assert_parser_ok!(parse_distance, " 30\" ", 30.0 / 3600.0, ""); 
         assert_parser_ok!(parse_distance, " 60' ", 1.0, ""); 
-        assert_parser_ok!(parse_distance, " 200.0 ", 200.0, ""); // Pixel distance (no unit, no conversion)
+        assert_parser_ok!(parse_distance, " 200.0 ", 200.0, ""); 
     }
 
     #[test]
