@@ -360,18 +360,15 @@ fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature, active
 
 // This function parses the properties part of a shape definition (e.g., # color=red width=1)
 fn parse_optional_shape_properties_and_tags<'a>(input: Input<'a>) -> ParserResult<'a, (HashMap<String, AttributeValue>, Vec<String>)> {
-    context(
-        "optional shape properties and tags",
-        map(
-            opt(
-                preceded(
-                    context("property marker '#'", tuple((ws, nom_char('#'), ws1))),
-                    parse_attributes_and_tags_list 
-                )
-            ),
-            |opt_attrs_tuple| opt_attrs_tuple.unwrap_or_else(|| (HashMap::new(), Vec::new()))
-        )
-    )(input)
+    alt((
+        // Case 1: Has properties (starts with #)
+        preceded(
+            tuple((ws, nom_char('#'), ws)),
+            parse_attributes_and_tags_list
+        ),
+        // Case 2: No properties, just return empty collections
+        map(ws, |_| (HashMap::new(), Vec::new()))
+    ))(input)
 }
 
 
@@ -444,7 +441,9 @@ fn parse_shape_and_props<'a>(
                  return Err(nom::Err::Failure(ctx_err)); 
             };
             
-            let (i_after_props, (props_hashmap, tags_vec)) = parse_optional_shape_properties_and_tags(i_after_coords_parsing)?; 
+            let (i_after_props, (props_hashmap, tags_vec)) = parse_optional_shape_properties_and_tags(i_after_coords_parsing)?;
+            
+            // No need to explicitly consume trailing whitespace here as it will be handled by the outer parser
             
             if let ShapeType::Unsupported(_) = shape_type_enum_captured {
             } else if let Some(signature) = get_shape_signature(&shape_keyword_lc_captured) {
@@ -540,7 +539,10 @@ fn parse_comment_line<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
     map(
         preceded(
             nom_char('#'),
-            opt(not_line_ending) 
+            terminated(
+                opt(not_line_ending),
+                opt(line_ending) // Optionally consume a line ending if present
+            )
         ),
         |comment_opt: Option<&str>| ParsedLine::Comment(comment_opt.unwrap_or("").trim_start().to_string())
     )(input)
@@ -550,44 +552,51 @@ fn parse_comment_line<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
 fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
     preceded(
         ws, // Consume leading whitespace for the entire line content once
-        alt((
-            // 1. Comment line (starts with # AFTER initial ws)
-            parse_comment_line,
-            // 2. Global attribute line
-            map(parse_global_line, |(attributes, tags)| ParsedLine::GlobalAttributes { attributes, tags }),
-            // 3. COORD_SYSTEM ; SHAPE_DEFINITION
-            map(
-                tuple((
-                    parse_coord_system_command,
-                    preceded(ws, nom_char(';')),
-                    preceded(ws, |i| parse_shape_and_props(i, None)) // Temporarily pass None, cs will be added in map
-                )),
-                |(cs, _, (exclude, st, coords, props, tags))| ParsedLine::ShapeDecl {
-                    coord_system: Some(cs), // Use the cs parsed in this branch
-                    exclude,
-                    shape_type: st,
-                    coordinates: coords,
-                    properties: props,
-                    tags,
-                }
-            ),
-            // 4. SHAPE_DEFINITION (alone on a line) - No preceding CS
-            map(
-                |i| parse_shape_and_props(i, None), // Pass None for active_system
-                |(exclude, st, coords, props, tags)| ParsedLine::ShapeDecl {
-                    coord_system: None,
-                    exclude,
-                    shape_type: st,
-                    coordinates: coords,
-                    properties: props,
-                    tags,
-                }
-            ),
-            // 5. COORD_SYSTEM (alone on a line)
-            map(parse_coord_system_command, ParsedLine::CoordSysDecl),
-            // 6. Empty line (only eof after ws)
-            map(eof, |_| ParsedLine::Empty)
-        ))
+        terminated(
+            alt((
+                // 1. Comment line (starts with # AFTER initial ws)
+                parse_comment_line,
+                // 2. Global attribute line
+                map(parse_global_line, |(attributes, tags)| ParsedLine::GlobalAttributes { attributes, tags }),
+                // 3. COORD_SYSTEM ; SHAPE_DEFINITION
+                map(
+                    tuple((
+                        parse_coord_system_command,
+                        preceded(ws, nom_char(';')),
+                        preceded(ws, |i| parse_shape_and_props(i, None)) // Temporarily pass None, cs will be added in map
+                    )),
+                    |(cs, _, (exclude, st, coords, props, tags))| ParsedLine::ShapeDecl {
+                        coord_system: Some(cs), // Use the cs parsed in this branch
+                        exclude,
+                        shape_type: st,
+                        coordinates: coords,
+                        properties: props,
+                        tags,
+                    }
+                ),
+                // 4. COORD_SYSTEM (alone on a line) - Moved up before shape parsing
+                // This parser specifically handles coordinate systems that are alone on a line
+                map(
+                    terminated(parse_coord_system_command, ws),
+                    ParsedLine::CoordSysDecl
+                ),
+                // 5. SHAPE_DEFINITION (alone on a line) - No preceding CS
+                map(
+                    |i| parse_shape_and_props(i, None), // Pass None for active_system
+                    |(exclude, st, coords, props, tags)| ParsedLine::ShapeDecl {
+                        coord_system: None,
+                        exclude,
+                        shape_type: st,
+                        coordinates: coords,
+                        properties: props,
+                        tags,
+                    }
+                ),
+                // 6. Empty line (only eof after ws)
+                map(eof, |_| ParsedLine::Empty)
+            )),
+            opt(line_ending) // Optionally consume a line ending if present
+        )
     )(input)
 }
 
@@ -803,6 +812,24 @@ mod tests {
         assert_rust_parses_line!("fk5; circle(1,2,3)", Some(CoordSystem::Fk5), ShapeType::Circle, false, 3, 0, 0);
         assert_rust_parses_line!(" J2000 ; point(10,20) # text={test}", Some(CoordSystem::J2000), ShapeType::Point, false, 2, 1, 0);
         assert_rust_parses_line!("fk4; -circle(1,2,3)", Some(CoordSystem::Fk4), ShapeType::Circle, true, 3, 0, 0);
+    }
+    
+    #[test]
+    fn test_rust_parse_with_newline_at_end() {
+        // Test coordinate system with newline
+        assert_rust_parses_line!("fk5\n", Some(CoordSystem::Fk5), CoordSysOnly);
+        
+        // Test shape with newline
+        assert_rust_parses_line!("circle(100,200,30)\n", None, ShapeType::Circle, false, 3, 0, 0);
+        
+        // Test coordinate system with shape and newline
+        assert_rust_parses_line!("fk5; circle(1,2,3)\n", Some(CoordSystem::Fk5), ShapeType::Circle, false, 3, 0, 0);
+        
+        // Test empty line with newline
+        assert_rust_parses_line!("\n", EmptyLine);
+        
+        // Test comment with newline
+        assert_rust_parses_line!("# comment\n", Comment, "comment");
     }
     
     #[test]
