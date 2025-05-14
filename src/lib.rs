@@ -297,28 +297,28 @@ fn parse_global_line<'a>(input: Input<'a>) -> ParserResult<'a, (HashMap<String, 
 
 // --- Component Parsers (for shapes) ---
 fn comma_sep<'a>(input: Input<'a>) -> ParserResult<'a, ()> { value((), tuple((ws, nom_char(','), ws)))(input)}
-fn parse_semantic_sequence<'a>(param_types: &'static [SemanticCoordType]) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> { 
+fn parse_semantic_sequence<'a>(param_types: &'static [SemanticCoordType], active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> + 'a { 
     move |mut i: Input| {
         let mut coords = Vec::with_capacity(param_types.len());
         if param_types.is_empty() { return Ok((i, coords)); }
-        let (next_i, val) = dispatch_semantic_parser(param_types[0])(i)?;
+        let (next_i, val) = dispatch_semantic_parser(param_types[0], active_system)(i)?;
         coords.push(val);
         i = next_i;
         for &semantic_type in param_types.iter().skip(1) {
             let (next_i_comma, _) = comma_sep(i)?;
-            let (next_i_val, val) = dispatch_semantic_parser(semantic_type)(next_i_comma)?;
+            let (next_i_val, val) = dispatch_semantic_parser(semantic_type, active_system)(next_i_comma)?;
             coords.push(val);
             i = next_i_val;
         }
         Ok((i, coords))
     }
 }
-fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> { 
+fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature, active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> + 'a { 
     move |mut i: Input| {
         let mut all_coords = Vec::new();
         let original_input_for_error_reporting = i; 
         if !signature.fixed_head.is_empty() {
-            let (next_i, head_coords) = parse_semantic_sequence(signature.fixed_head)(i)?;
+            let (next_i, head_coords) = parse_semantic_sequence(signature.fixed_head, active_system)(i)?;
             all_coords.extend(head_coords);
             i = next_i;
         }
@@ -327,14 +327,14 @@ fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature) -> imp
             if !repeat_unit_def.is_empty() {
                 for _ in 0..signature.min_repeats {
                     if !all_coords.is_empty() { let (next_i, _) = comma_sep(i)?; i = next_i; }
-                    let (next_i, unit_coords) = parse_semantic_sequence(repeat_unit_def)(i)?;
+                    let (next_i, unit_coords) = parse_semantic_sequence(repeat_unit_def, active_system)(i)?;
                     all_coords.extend(unit_coords); i = next_i; actual_repeats += 1;
                 }
                 let max_additional_repeats = signature.max_repeats.map_or(usize::MAX, |max_r| if max_r >= signature.min_repeats { max_r - signature.min_repeats } else { 0 });
                 for _ in 0..max_additional_repeats {
                     let mut temp_i = i;
                     if !all_coords.is_empty() { match comma_sep(temp_i) { Ok((next_i, _)) => temp_i = next_i, Err(_) => break, } }
-                    match parse_semantic_sequence(repeat_unit_def)(temp_i) {
+                    match parse_semantic_sequence(repeat_unit_def, active_system)(temp_i) {
                         Ok((next_i, unit_coords)) => { all_coords.extend(unit_coords); i = next_i; actual_repeats += 1; }
                         Err(_) => break, 
                     }
@@ -347,7 +347,7 @@ fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature) -> imp
         }
         if !signature.fixed_tail.is_empty() {
             if !all_coords.is_empty() { let (next_i, _) = comma_sep(i)?; i = next_i; }
-            let (next_i, tail_coords) = parse_semantic_sequence(signature.fixed_tail)(i)?;
+            let (next_i, tail_coords) = parse_semantic_sequence(signature.fixed_tail, active_system)(i)?;
             all_coords.extend(tail_coords); i = next_i;
         }
         if all_coords.is_empty() && signature.fixed_head.is_empty() && signature.fixed_tail.is_empty() && signature.min_repeats == 0 {} 
@@ -409,7 +409,10 @@ fn get_shape_signature(shape_name_lc: &str) -> Option<&'static ShapeSignature> {
 // --- Shape Parser (Rust internal result) ---
 // This function parses the shape part: `[-]shape_keyword(coords) # properties`
 // Returns (is_excluded, ShapeType enum, Vec<f64>, HashMap<String, AttributeValue>, Vec<String> for tags)
-fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, HashMap<String, AttributeValue>, Vec<String>)> {
+fn parse_shape_and_props<'a>(
+    input: Input<'a>, 
+    active_system: Option<&'a CoordSystem> 
+) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, HashMap<String, AttributeValue>, Vec<String>)> {
     let (i, opt_exclusion_char) = opt(nom_char('-'))(input)?;
     let exclude = opt_exclusion_char.is_some();
     let (i, _) = ws(i)?; 
@@ -434,7 +437,7 @@ fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeT
             let (i_after_coords_parsing, coords_vec) = if let ShapeType::Unsupported(_) = shape_type_enum_captured {
                 preceded(context("opening parenthesis for unsupported shape", tuple((ws, nom_char('(')))), terminated(nom::multi::separated_list1(context("coordinate separator comma", tuple((ws, nom_char(','), ws))), context("f64 for unsupported", preceded(ws, terminated(double, ws)))), context("closing parenthesis for unsupported shape", tuple((ws, nom_char(')'))))))(inner_input)?
             } else if let Some(signature) = get_shape_signature(&shape_keyword_lc_captured) {
-                preceded(context("opening parenthesis", tuple((ws, nom_char('(')))), terminated(parse_coordinates_by_signature(signature), context("closing parenthesis", tuple((ws, nom_char(')'))))))(inner_input)?
+                preceded(context("opening parenthesis", tuple((ws, nom_char('(')))), terminated(parse_coordinates_by_signature(signature, active_system), context("closing parenthesis", tuple((ws, nom_char(')'))))))(inner_input)?
             } else {
                  let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(inner_input, nom::error::ErrorKind::Verify);
                  let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(inner_input, "internal signature missing for known shape (inside cut)", base_err);
@@ -544,30 +547,59 @@ fn parse_comment_line<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
 }
 
 
-fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> { 
-    alt((
-        map(preceded(ws, parse_comment_line), |c| c), 
-        map(preceded(ws, parse_global_line), |(attributes, tags)| ParsedLine::GlobalAttributes { attributes, tags }), 
-        map(
-            tuple((preceded(ws, parse_coord_system_command), ws, nom_char(';'), preceded(ws, parse_shape_and_props) )),
-            |(cs, _, _, (exclude, st, coords, props, tags))| ParsedLine::ShapeDecl { coord_system: Some(cs), exclude, shape_type: st, coordinates: coords, properties: props, tags }
-        ),
-        map(preceded(ws, parse_coord_system_command), |cs| ParsedLine::CoordSysDecl(cs)),
-        map(preceded(ws, parse_shape_and_props), |(exclude, st, coords, props, tags)| ParsedLine::ShapeDecl { coord_system: None, exclude, shape_type: st, coordinates: coords, properties: props, tags }),
-        map(tuple((ws, eof)), |_| ParsedLine::Empty) 
-    ))(input)
+fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
+    preceded(
+        ws, // Consume leading whitespace for the entire line content once
+        alt((
+            // 1. Comment line (starts with # AFTER initial ws)
+            parse_comment_line,
+            // 2. Global attribute line
+            map(parse_global_line, |(attributes, tags)| ParsedLine::GlobalAttributes { attributes, tags }),
+            // 3. COORD_SYSTEM ; SHAPE_DEFINITION
+            map(
+                tuple((
+                    parse_coord_system_command,
+                    preceded(ws, nom_char(';')),
+                    preceded(ws, |i| parse_shape_and_props(i, None)) // Temporarily pass None, cs will be added in map
+                )),
+                |(cs, _, (exclude, st, coords, props, tags))| ParsedLine::ShapeDecl {
+                    coord_system: Some(cs), // Use the cs parsed in this branch
+                    exclude,
+                    shape_type: st,
+                    coordinates: coords,
+                    properties: props,
+                    tags,
+                }
+            ),
+            // 4. SHAPE_DEFINITION (alone on a line) - No preceding CS
+            map(
+                |i| parse_shape_and_props(i, None), // Pass None for active_system
+                |(exclude, st, coords, props, tags)| ParsedLine::ShapeDecl {
+                    coord_system: None,
+                    exclude,
+                    shape_type: st,
+                    coordinates: coords,
+                    properties: props,
+                    tags,
+                }
+            ),
+            // 5. COORD_SYSTEM (alone on a line)
+            map(parse_coord_system_command, ParsedLine::CoordSysDecl),
+            // 6. Empty line (only eof after ws)
+            map(eof, |_| ParsedLine::Empty)
+        ))
+    )(input)
 }
 
 
 // --- Main Parsing Function (for Rust usage, returns Result) ---
 pub fn parse_single_region_line_for_rust(line: &str) -> Result<ParsedLine, String> { 
-    match terminated(parse_line_content, ws)(line).finish() { 
+    match terminated(parse_line_content, eof)(line).finish() { 
         Ok((_remaining, output)) => {
             if matches!(output, ParsedLine::Empty) && !line.trim().is_empty() && !line.trim().starts_with('#') {
-                Err(format!("Line parsed as Empty but was not truly empty or comment: '{}'", line))
-            } else {
-                Ok(output)
+                return Err(format!("Line parsed as Empty but was not truly empty or comment: '{}'", line));
             }
+            Ok(output)
         },
         Err(e) => Err(nom::error::convert_error(line, e)),
     }
@@ -600,7 +632,7 @@ fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> {
                     let shape_obj = Shape::new(
                         shape_type.to_string_py(),
                         coordinates,
-                        &py_props_dict, // Pass as &Bound PyDict
+                        &py_props_dict, 
                         tags,
                         exclude,
                     )?;
@@ -729,7 +761,7 @@ mod tests {
             let result = parse_single_region_line_for_rust($input);
              if result.is_ok() {
                  if let Ok(ParsedLine::Empty) = result {
-                      if !$input.trim().is_empty() { 
+                      if !$input.trim().is_empty() && !$input.trim().starts_with('#') { 
                         panic!("Internal parsing should have failed for '{}' but succeeded with Empty", $input);
                       }
                  } else if let Ok(ParsedLine::Comment(_)) = result {
