@@ -7,7 +7,7 @@
 // --- PyO3 Imports ---
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyTuple, PyDict, IntoPyDict}; 
+use pyo3::types::{PyTuple, PyDict, IntoPyDict, PyList}; 
 
 // --- Nom Imports ---
 use nom::{
@@ -15,9 +15,9 @@ use nom::{
     branch::alt, 
     character::complete::{alphanumeric1, multispace0, multispace1, char as nom_char, digit1, not_line_ending, line_ending},
     bytes::complete::{take_while1, tag_no_case, take_until}, 
-    combinator::{map, map_res, opt, value, recognize, cut, eof}, 
+    combinator::{map, map_res, opt, value, recognize, cut, eof, peek}, 
     sequence::{preceded, terminated, separated_pair, tuple, pair, delimited}, 
-    multi::{separated_list0, separated_list1},
+    multi::{separated_list0, separated_list1, many0_count},
     number::complete::double,
     error::{VerboseError, context, ParseError as NomParseErrorTrait, ContextError},
     Finish,
@@ -47,9 +47,9 @@ pub struct ShapeSignature {
     pub fixed_tail: &'static [SemanticCoordType],
 }
 
-// --- Global Attribute Value Definition ---
+// --- Attribute Value Definition (used for both Global and Shape Properties) ---
 #[derive(Debug, PartialEq, Clone)]
-pub enum GlobalAttributeValue {
+pub enum AttributeValue {
     String(String),
     Number(f64),
     NumberList(Vec<f64>),
@@ -90,7 +90,7 @@ impl CoordSystem {
 #[derive(Debug, PartialEq, Clone)]
 pub enum ShapeType { 
     Circle, Ellipse, Box, RotBox, Polygon, Point, Line, Annulus, Pie,
-    Panda, Epanda, Bpanda, Vector, Text,
+    Panda, Epanda, Bpanda, Vector, Text, Ruler, 
     Unsupported(String),
 }
 impl ShapeType { 
@@ -100,20 +100,94 @@ impl ShapeType {
             ShapeType::RotBox => "rotbox", ShapeType::Polygon => "polygon", ShapeType::Point => "point",
             ShapeType::Line => "line", ShapeType::Annulus => "annulus", ShapeType::Pie => "pie",
             ShapeType::Panda => "panda", ShapeType::Epanda => "epanda", ShapeType::Bpanda => "bpanda",
-            ShapeType::Vector => "vector", ShapeType::Text => "text",
+            ShapeType::Vector => "vector", ShapeType::Text => "text", ShapeType::Ruler => "ruler",
             ShapeType::Unsupported(s) => return format!("unsupported({})", s),
         }.to_string()
     }
 }
-#[pyclass(get_all, set_all)] #[derive(Debug, PartialEq, Clone)] pub struct Property { pub key: String, pub value: String }
-#[pymethods] impl Property { #[new] fn new(key: String, value: String) -> Self { Property { key, value } } }
+
+#[pyclass(get_all, set_all)] 
+#[derive(Debug, PartialEq, Clone)] 
+pub struct Property { 
+    pub key: String,
+    pub value: String, 
+}
+
+#[pymethods]
+impl Property {
+    #[new]
+    fn new(key: String, value: String) -> Self {
+        Property { key, value }
+    }
+}
+
 #[pyclass] #[derive(Debug, Clone)] pub struct Shape {
     #[pyo3(get)] shape_type_str: String,
     #[pyo3(get)] coordinates: Vec<f64>, 
-    #[pyo3(get)] properties: Vec<Py<Property>>,
+    properties_internal: HashMap<String, AttributeValue>,
+    #[pyo3(get)] tags_internal: Vec<String>, 
     #[pyo3(get)] exclude: bool,
 }
-#[pymethods] impl Shape { #[new] fn new(shape_type_str: String, coordinates: Vec<f64>, properties: Vec<Py<Property>>, exclude: bool) -> Self { Shape { shape_type_str, coordinates, properties, exclude } } }
+
+#[pymethods] 
+impl Shape { 
+    #[new] 
+    fn new(
+        shape_type_str: String, 
+        coordinates: Vec<f64>, 
+        properties_py: &Bound<'_, PyDict>, 
+        tags_internal: Vec<String>, 
+        exclude: bool
+    ) -> PyResult<Self> { 
+        let mut properties_internal_map = HashMap::new();
+        for (key_obj, value_obj) in properties_py.iter() {
+            let key: String = key_obj.extract()?;
+            let attr_value = if let Ok(s) = value_obj.extract::<String>() {
+                AttributeValue::String(s)
+            } else if let Ok(f) = value_obj.extract::<f64>() {
+                AttributeValue::Number(f)
+            } else if let Ok(b) = value_obj.extract::<bool>() {
+                AttributeValue::Flag(b)
+            } else if let Ok(list_f64) = value_obj.extract::<Vec<f64>>() {
+                 AttributeValue::NumberList(list_f64)
+            } else if let Ok(list_i64) = value_obj.extract::<Vec<i64>>() { 
+                 AttributeValue::NumberList(list_i64.into_iter().map(|x| x as f64).collect())
+            }
+            else {
+                return Err(PyValueError::new_err(format!("Unsupported value type for property '{}'", key)));
+            };
+            properties_internal_map.insert(key, attr_value);
+        }
+
+        Ok(Shape { 
+            shape_type_str, 
+            coordinates, 
+            properties_internal: properties_internal_map, 
+            tags_internal, 
+            exclude 
+        }) 
+    }
+
+    #[getter]
+    fn properties(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new_bound(py);
+        for (k, v_enum) in &self.properties_internal {
+            let py_val = match v_enum {
+                AttributeValue::String(s) => s.to_object(py),
+                AttributeValue::Number(n) => n.to_object(py),
+                AttributeValue::NumberList(nl) => nl.to_object(py),
+                AttributeValue::Flag(b) => b.to_object(py),
+            };
+            dict.set_item(k, py_val)?;
+        }
+        Ok(dict.into())
+    }
+
+    #[getter]
+    fn tags(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        Ok(PyList::new_bound(py, &self.tags_internal).into())
+    }
+}
 
 // --- Parser Implementation ---
 type Input<'a> = &'a str;
@@ -143,13 +217,15 @@ fn parse_coord_system_command<'a>(input: Input<'a>) -> ParserResult<'a, CoordSys
     )(input)
 }
 
-// --- Global Attribute Parsers ---
-fn parse_quoted_string_value<'a>(input: Input<'a>) -> ParserResult<'a, String> { 
+// --- Attribute Parsers ---
+
+fn parse_delimited_string_value<'a>(input: Input<'a>) -> ParserResult<'a, String> { 
     context(
-        "quoted string value",
+        "delimited string value",
         alt((
             map(delimited(nom_char('"'), take_until("\""), nom_char('"')), |s: &str| s.to_string()),
             map(delimited(nom_char('\''), take_until("'"), nom_char('\'')), |s: &str| s.to_string()),
+            map(delimited(nom_char('{'), take_until("}"), nom_char('}')), |s: &str| s.to_string()),
         ))
     )(input)
 }
@@ -159,28 +235,64 @@ fn parse_dashlist_value<'a>(input: Input<'a>) -> ParserResult<'a, Vec<f64>> {
 fn parse_flag_value<'a>(input: Input<'a>) -> ParserResult<'a, bool> { 
     context("flag value (0 or 1)", alt((map(nom_char('1'), |_| true), map(nom_char('0'), |_| false))))(input)
 }
-fn parse_simple_word_value<'a>(input: Input<'a>) -> ParserResult<'a, String> { 
-    map(take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '+' || c == '-'), |s: &str| s.to_string())(input)
+fn parse_simple_word_or_number_value_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { 
+    recognize(take_while1(|c: char| !c.is_whitespace() && c != '=' && c != '#'))(input)
 }
-fn parse_single_global_attribute<'a>(input: Input<'a>) -> ParserResult<'a, (String, GlobalAttributeValue)> { 
+
+/// Parses a single attribute pair (key=value) or a valueless key.
+/// Returns (key_string, AttributeValue) or just (key_string, AttributeValue::Flag(true)) for valueless.
+fn parse_attribute_pair<'a>(input: Input<'a>) -> ParserResult<'a, (String, AttributeValue)> { 
     let (i, key_str_val) = parse_identifier_str_no_leading_ws(input)?; 
-    let (i, _) = preceded(ws, nom_char('='))(i)?;
-    let (i, _) = ws(i)?; 
     let key_lc = key_str_val.trim().to_lowercase();
-    match key_lc.as_str() {
-        "dashlist" => map(parse_dashlist_value, |v| (key_str_val.trim().to_string(), GlobalAttributeValue::NumberList(v)))(i),
-        "font" => map(parse_quoted_string_value, |v| (key_str_val.trim().to_string(), GlobalAttributeValue::String(v)))(i),
-        "color" => map(parse_simple_word_value, |v| (key_str_val.trim().to_string(), GlobalAttributeValue::String(v)))(i), 
-        "width" | "lw" | "lwidth" => map(double, |v| (key_str_val.trim().to_string(), GlobalAttributeValue::Number(v)))(i), 
-        "select" | "highlite" | "dash" | "fixed" | "edit" | "move" | "delete" | "include" | "source" => map(parse_flag_value, |v| (key_str_val.trim().to_string(), GlobalAttributeValue::Flag(v)))(i),
-        _ => map(parse_simple_word_value, |v| (key_str_val.trim().to_string(), GlobalAttributeValue::String(v)))(i), 
+    
+    let (i, opt_value_parser_result) = opt(preceded(tuple((ws, nom_char('='), ws)), 
+        alt((
+            |i_val: Input<'a>| if key_lc == "dashlist" || key_lc == "line" { map(parse_dashlist_value, AttributeValue::NumberList)(i_val) } else { Err(nom::Err::Error(NomVerboseError::from_error_kind(i_val, nom::error::ErrorKind::Alt))) },
+            |i_val: Input<'a>| if key_lc == "font" || key_lc == "text" || key_lc == "label" || key_lc == "tag" || key_lc == "format" || key_lc == "ruler" || key_lc == "point" { map(parse_delimited_string_value, AttributeValue::String)(i_val) } else { Err(nom::Err::Error(NomVerboseError::from_error_kind(i_val, nom::error::ErrorKind::Alt))) },
+            |i_val: Input<'a>| if ["color"].contains(&key_lc.as_str()) { map(parse_simple_word_or_number_value_str, |s| AttributeValue::String(s.to_string()))(i_val) } else { Err(nom::Err::Error(NomVerboseError::from_error_kind(i_val, nom::error::ErrorKind::Alt))) },
+            |i_val: Input<'a>| if ["width", "lw", "lwidth", "radius", "major", "minor", "angle", "alpha", "size", "textangle"].contains(&key_lc.as_str()) { map(double, AttributeValue::Number)(i_val) } else { Err(nom::Err::Error(NomVerboseError::from_error_kind(i_val, nom::error::ErrorKind::Alt))) },
+            |i_val: Input<'a>| if ["select", "highlite", "dash", "fixed", "edit", "move", "rotate", "delete", "include", "source", "background", "fill", "textrotate"].contains(&key_lc.as_str()) { map(parse_flag_value, AttributeValue::Flag)(i_val) } else { Err(nom::Err::Error(NomVerboseError::from_error_kind(i_val, nom::error::ErrorKind::Alt))) },
+            map(recognize(double), |s: &str| AttributeValue::Number(s.parse().unwrap_or(0.0))), 
+            map(parse_simple_word_or_number_value_str, |s| AttributeValue::String(s.to_string())),
+        ))
+    ))(i)?;
+
+    if let Some(value_enum) = opt_value_parser_result {
+        Ok((i, (key_str_val.trim().to_string(), value_enum)))
+    } else {
+        if ["source", "background", "include", "dash", "fixed", "edit", "move", "rotate", "delete", "select", "highlite", "fill", "textrotate"].contains(&key_lc.as_str()){ 
+             Ok((i, (key_str_val.trim().to_string(), AttributeValue::Flag(true))))
+        } else {
+            Err(nom::Err::Error(NomVerboseError::add_context(input, "expected value for attribute or known valueless flag", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(key_str_val, nom::error::ErrorKind::Tag))))
+        }
     }
 }
-fn parse_global_attributes_list<'a>(input: Input<'a>) -> ParserResult<'a, HashMap<String, GlobalAttributeValue>> { 
-    map(nom::multi::separated_list0(ws1, parse_single_global_attribute), |attrs_vec| attrs_vec.into_iter().collect())(input)
+
+// Parses a list of attributes (key=value pairs or valueless keys)
+// Returns a HashMap for general attributes and a Vec<String> for tags
+fn parse_attributes_and_tags_list<'a>(input: Input<'a>) -> ParserResult<'a, (HashMap<String, AttributeValue>, Vec<String>)> { 
+    map(
+        nom::multi::separated_list0(ws1, parse_attribute_pair), 
+        |attrs_vec| {
+            let mut attrs_map = HashMap::new();
+            let mut tags_vec = Vec::new();
+            for (key, value) in attrs_vec {
+                if key.eq_ignore_ascii_case("tag") {
+                    if let AttributeValue::String(s_val) = value {
+                        tags_vec.push(s_val);
+                    } 
+                } else {
+                    attrs_map.insert(key, value);
+                }
+            }
+            (attrs_map, tags_vec)
+        }
+    )(input)
 }
-fn parse_global_line<'a>(input: Input<'a>) -> ParserResult<'a, HashMap<String, GlobalAttributeValue>> { 
-    preceded(pair(tag_no_case("global"), ws1), parse_global_attributes_list)(input)
+
+
+fn parse_global_line<'a>(input: Input<'a>) -> ParserResult<'a, (HashMap<String, AttributeValue>, Vec<String>)> { 
+    preceded(pair(tag_no_case("global"), ws1), parse_attributes_and_tags_list)(input)
 }
 
 // --- Component Parsers (for shapes) ---
@@ -245,9 +357,23 @@ fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature) -> imp
         Ok((i, all_coords))
     }
 }
-fn parse_property_value_str<'a>(input: Input<'a>) -> ParserResult<'a, &'a str> { context("property value", take_while1(|c: char| !c.is_whitespace() && c != '#'))(input)}
-fn parse_property_internal<'a>(input: Input<'a>) -> ParserResult<'a, Property> { context("property", map(separated_pair(parse_identifier_str_no_leading_ws, tuple((ws, nom_char('='), ws)), parse_property_value_str), |(k, v)| Property { key: k.to_string(), value: v.to_string() } ))(input)}
-fn parse_optional_properties_internal<'a>(input: Input<'a>) -> ParserResult<'a, Vec<Property>> { context("optional properties", map(opt(preceded(context("property marker '#'", tuple((ws, nom_char('#'), ws1))), nom::multi::separated_list0(ws1, parse_property_internal))), |opt_props| opt_props.unwrap_or_else(Vec::new)))(input)}
+
+// This function parses the properties part of a shape definition (e.g., # color=red width=1)
+fn parse_optional_shape_properties_and_tags<'a>(input: Input<'a>) -> ParserResult<'a, (HashMap<String, AttributeValue>, Vec<String>)> {
+    context(
+        "optional shape properties and tags",
+        map(
+            opt(
+                preceded(
+                    context("property marker '#'", tuple((ws, nom_char('#'), ws1))),
+                    parse_attributes_and_tags_list 
+                )
+            ),
+            |opt_attrs_tuple| opt_attrs_tuple.unwrap_or_else(|| (HashMap::new(), Vec::new()))
+        )
+    )(input)
+}
+
 
 // --- Shape Definition Logic ---
 macro_rules! sct_slice { ($($x:expr),* $(,)?) => { &[$($x),*] } }
@@ -267,7 +393,7 @@ static PANDA_SIG: ShapeSignature = ShapeSignature { name: "panda", fixed_head: s
 static EPANDA_SIG: ShapeSignature = ShapeSignature { name: "epanda", fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Distance, Distance, Integer, Angle], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![]};
 static BPANDA_SIG: ShapeSignature = ShapeSignature { name: "bpanda", fixed_head: sct_slice![CoordOdd, CoordEven, Angle, Angle, Integer, Distance, Distance, Distance, Distance, Integer, Angle], repeat_unit: None, min_repeats: 0, max_repeats: None, fixed_tail: sct_slice![]};
 
-fn get_shape_signature(shape_name_lc: &str) -> Option<&'static ShapeSignature> { /* ... (same as before) ... */ 
+fn get_shape_signature(shape_name_lc: &str) -> Option<&'static ShapeSignature> { 
     match shape_name_lc {
         "circle" => Some(&CIRCLE_SIG), "ellipse" => Some(&ELLIPSE_SIG),
         "box" => Some(&BOX_SIG), "rotbox" => Some(&ROTBOX_SIG),
@@ -282,15 +408,15 @@ fn get_shape_signature(shape_name_lc: &str) -> Option<&'static ShapeSignature> {
 
 // --- Shape Parser (Rust internal result) ---
 // This function parses the shape part: `[-]shape_keyword(coords) # properties`
-// Returns (is_excluded, ShapeType enum, Vec<f64>, Vec<Property>)
-fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, Vec<Property>)> {
+// Returns (is_excluded, ShapeType enum, Vec<f64>, HashMap<String, AttributeValue>, Vec<String> for tags)
+fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, HashMap<String, AttributeValue>, Vec<String>)> {
     let (i, opt_exclusion_char) = opt(nom_char('-'))(input)?;
     let exclude = opt_exclusion_char.is_some();
     let (i, _) = ws(i)?; 
     
     let (i_after_keyword, shape_keyword) = parse_identifier_str_no_leading_ws(i)?;
 
-    let (i_final, (coords, props_list)) = cut(
+    let (i_final, (coords_from_cut, (props_map_from_cut, tags_from_cut))) = cut( 
         |inner_input: Input<'a>| {
             let shape_keyword_lc_captured = shape_keyword.to_lowercase(); 
             let shape_type_enum_captured = match shape_keyword_lc_captured.as_str() {
@@ -301,6 +427,7 @@ fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeT
                 "pie" => ShapeType::Pie, "panda" => ShapeType::Panda,
                 "epanda" => ShapeType::Epanda, "bpanda" => ShapeType::Bpanda,
                 "vector" => ShapeType::Vector, "text" => ShapeType::Text,
+                "ruler" => ShapeType::Ruler,
                 _ => ShapeType::Unsupported(shape_keyword.to_string()),
             };
 
@@ -314,7 +441,7 @@ fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeT
                  return Err(nom::Err::Failure(ctx_err)); 
             };
             
-            let (i_after_props, props_vec) = parse_optional_properties_internal(i_after_coords_parsing)?;
+            let (i_after_props, (props_hashmap, tags_vec)) = parse_optional_shape_properties_and_tags(i_after_coords_parsing)?; 
             
             if let ShapeType::Unsupported(_) = shape_type_enum_captured {
             } else if let Some(signature) = get_shape_signature(&shape_keyword_lc_captured) {
@@ -362,7 +489,7 @@ fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeT
                     }
                 }
             }
-            Ok((i_after_props, (coords_vec, props_vec)))
+            Ok((i_after_props, (coords_vec, (props_hashmap, tags_vec)))) 
         }
     )(i_after_keyword)?; 
 
@@ -374,16 +501,17 @@ fn parse_shape_and_props<'a>(input: Input<'a>) -> ParserResult<'a, (bool, ShapeT
         "pie" => ShapeType::Pie, "panda" => ShapeType::Panda,
         "epanda" => ShapeType::Epanda, "bpanda" => ShapeType::Bpanda,
         "vector" => ShapeType::Vector, "text" => ShapeType::Text,
+        "ruler" => ShapeType::Ruler,
         _ => ShapeType::Unsupported(shape_keyword.to_string()),
     };
 
-    Ok((i_final, (exclude, shape_type_enum_final, coords, props_list)))
+    Ok((i_final, (exclude, shape_type_enum_final, coords_from_cut, props_map_from_cut, tags_from_cut))) 
 }
 
 
 // --- Main Line Parsing Logic (Internal Rust) ---
 // Represents the different kinds of valid lines we can parse.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum ParsedLine { 
     CoordSysDecl(CoordSystem),
     ShapeDecl {
@@ -391,9 +519,13 @@ pub enum ParsedLine {
         exclude: bool,
         shape_type: ShapeType,
         coordinates: Vec<f64>,
-        properties: Vec<Property>,
+        properties: HashMap<String, AttributeValue>, 
+        tags: Vec<String>,
     },
-    GlobalAttributes(HashMap<String, GlobalAttributeValue>),
+    GlobalAttributes { 
+        attributes: HashMap<String, AttributeValue>,
+        tags: Vec<String>, 
+    },
     Comment(String), 
     Empty, 
 }
@@ -415,27 +547,24 @@ fn parse_comment_line<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
 fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> { 
     alt((
         map(preceded(ws, parse_comment_line), |c| c), 
-        map(preceded(ws, parse_global_line), ParsedLine::GlobalAttributes), // Ensure ws is consumed before global
+        map(preceded(ws, parse_global_line), |(attributes, tags)| ParsedLine::GlobalAttributes { attributes, tags }), 
         map(
             tuple((preceded(ws, parse_coord_system_command), ws, nom_char(';'), preceded(ws, parse_shape_and_props) )),
-            |(cs, _, _, (exclude, st, coords, props))| ParsedLine::ShapeDecl { coord_system: Some(cs), exclude, shape_type: st, coordinates: coords, properties: props, }
+            |(cs, _, _, (exclude, st, coords, props, tags))| ParsedLine::ShapeDecl { coord_system: Some(cs), exclude, shape_type: st, coordinates: coords, properties: props, tags }
         ),
         map(preceded(ws, parse_coord_system_command), |cs| ParsedLine::CoordSysDecl(cs)),
-        map(preceded(ws, parse_shape_and_props), |(exclude, st, coords, props)| ParsedLine::ShapeDecl { coord_system: None, exclude, shape_type: st, coordinates: coords, properties: props, }),
-        map(tuple((ws, eof)), |_| ParsedLine::Empty) // Correctly parse empty/whitespace-only lines
+        map(preceded(ws, parse_shape_and_props), |(exclude, st, coords, props, tags)| ParsedLine::ShapeDecl { coord_system: None, exclude, shape_type: st, coordinates: coords, properties: props, tags }),
+        map(tuple((ws, eof)), |_| ParsedLine::Empty) 
     ))(input)
 }
 
 
 // --- Main Parsing Function (for Rust usage, returns Result) ---
 pub fn parse_single_region_line_for_rust(line: &str) -> Result<ParsedLine, String> { 
-    // The `terminated` here ensures that after `parse_line_content` (which should consume all meaningful content),
-    // only optional trailing whitespace remains. `finish` ensures the whole original line was accounted for.
     match terminated(parse_line_content, ws)(line).finish() { 
         Ok((_remaining, output)) => {
-            // If the output is Empty, but the original line was not just whitespace, it's an error
-            if matches!(output, ParsedLine::Empty) && !line.trim().is_empty() {
-                Err(format!("Line parsed as Empty but was not whitespace-only: '{}'", line))
+            if matches!(output, ParsedLine::Empty) && !line.trim().is_empty() && !line.trim().starts_with('#') {
+                Err(format!("Line parsed as Empty but was not truly empty or comment: '{}'", line))
             } else {
                 Ok(output)
             }
@@ -454,32 +583,45 @@ fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> {
                     let result_elements: [PyObject; 4] = [cs.to_string_py().into_py(py), py.None(), py.None(), py.None()];
                     Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
                 }
-                ParsedLine::ShapeDecl{ coord_system, exclude, shape_type, coordinates, properties } => {
+                ParsedLine::ShapeDecl{ coord_system, exclude, shape_type, coordinates, properties, tags } => {
                     let py_coord_system = coord_system.map(|cs| cs.to_string_py()).into_py(py);
-                    let props_py: Vec<Py<Property>> = properties
-                        .into_iter()
-                        .map(|p_rust| Py::new(py, p_rust))
-                        .collect::<PyResult<_>>()?;
+                                        
+                    let py_props_dict = PyDict::new_bound(py);
+                    for (k, v_enum) in properties {
+                        let py_val = match v_enum {
+                            AttributeValue::String(s) => s.into_py(py),
+                            AttributeValue::Number(n) => n.into_py(py),
+                            AttributeValue::NumberList(nl) => nl.into_py(py),
+                            AttributeValue::Flag(b) => b.into_py(py),
+                        };
+                        py_props_dict.set_item(k, py_val)?;
+                    }
+                    
                     let shape_obj = Shape::new(
                         shape_type.to_string_py(),
                         coordinates,
-                        props_py,
+                        &py_props_dict, // Pass as &Bound PyDict
+                        tags,
                         exclude,
-                    );
+                    )?;
                     let py_shape = Py::new(py, shape_obj)?;
+
                     let result_elements: [PyObject; 4] = [py_coord_system, py_shape.into_py(py), py.None(), py.None()];
                     Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
                 }
-                ParsedLine::GlobalAttributes(attrs_map) => {
+                ParsedLine::GlobalAttributes{attributes, tags} => {
                     let py_attrs = PyDict::new_bound(py);
-                    for (k, v_enum) in attrs_map {
+                    for (k, v_enum) in attributes {
                         let py_val = match v_enum {
-                            GlobalAttributeValue::String(s) => s.into_py(py),
-                            GlobalAttributeValue::Number(n) => n.into_py(py),
-                            GlobalAttributeValue::NumberList(nl) => nl.into_py(py),
-                            GlobalAttributeValue::Flag(b) => b.into_py(py),
+                            AttributeValue::String(s) => s.into_py(py),
+                            AttributeValue::Number(n) => n.into_py(py),
+                            AttributeValue::NumberList(nl) => nl.into_py(py),
+                            AttributeValue::Flag(b) => b.into_py(py),
                         };
                         py_attrs.set_item(k, py_val)?;
+                    }
+                    if !tags.is_empty() {
+                        py_attrs.set_item("tags", tags.into_py(py))?;
                     }
                     let result_elements: [PyObject; 4] = [py.None(), py.None(), py_attrs.into_py(py), py.None()];
                     Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
@@ -503,7 +645,7 @@ fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> {
 fn rusty_region_parser(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_region_line, m)?)?;
     m.add_class::<Shape>()?;
-    m.add_class::<Property>()?;
+    m.add_class::<Property>()?; 
     Ok(())
 }
 
@@ -514,14 +656,15 @@ mod tests {
 
      macro_rules! assert_rust_parses_line {
         // For ShapeDecl
-        ($input:expr, $expected_cs:expr, $expected_shape_type:pat, $expected_exclude:expr, $expected_coords_len:expr, $expected_props_len:expr) => {
+        ($input:expr, $expected_cs:expr, $expected_shape_type:pat, $expected_exclude:expr, $expected_coords_len:expr, $expected_props_len:expr, $expected_tags_len:expr) => {
             match parse_single_region_line_for_rust($input) {
-                Ok(ParsedLine::ShapeDecl{coord_system, exclude, shape_type, coordinates, properties}) => {
+                Ok(ParsedLine::ShapeDecl{coord_system, exclude, shape_type, coordinates, properties, tags}) => {
                     assert_eq!(coord_system, $expected_cs, "CoordSystem mismatch for '{}'", $input);
                     assert_eq!(exclude, $expected_exclude, "Exclusion flag mismatch for '{}'", $input);
                     assert!(matches!(shape_type, $expected_shape_type), "Shape type mismatch for '{}'. Got: {:?}", $input, shape_type);
                     assert_eq!(coordinates.len(), $expected_coords_len, "Coordinate count mismatch for '{}'. Got: {:?}, expected {}", $input, coordinates, $expected_coords_len);
-                    assert_eq!(properties.len(), $expected_props_len, "Property count mismatch for '{}'. Got: {:?}, expected {}", $input, properties, $expected_props_len);
+                    assert_eq!(properties.len(), $expected_props_len, "Property count mismatch for '{}'. Got: {:?}, expected {}", $input, properties.keys(), $expected_props_len); 
+                    assert_eq!(tags.len(), $expected_tags_len, "Tag count mismatch for '{}'. Got: {:?}, expected {}", $input, tags, $expected_tags_len);
                 },
                 Ok(other) => panic!("Expected ShapeDecl, got {:?} for '{}'", other, $input),
                 Err(e_str) => panic!("Internal parsing failed for '{}':\n{}", $input, e_str),
@@ -538,10 +681,11 @@ mod tests {
             }
         };
          // For GlobalAttributes
-        ($input:expr, GlobalAttrs, $expected_attr_count:expr $(, $key:expr => { $($val_pat_tokens:tt)+ } )* ) => { 
+        ($input:expr, GlobalAttrs, $expected_attr_count:expr, $expected_tags_len:expr $(, $key:expr => { $($val_pat_tokens:tt)+ } )* ) => { 
             match parse_single_region_line_for_rust($input) {
-                Ok(ParsedLine::GlobalAttributes(attrs)) => {
+                Ok(ParsedLine::GlobalAttributes{attributes: attrs, tags}) => {
                     assert_eq!(attrs.len(), $expected_attr_count, "Global attribute count mismatch for '{}'", $input);
+                    assert_eq!(tags.len(), $expected_tags_len, "Global tags count mismatch for '{}'", $input);
                     $(
                         match attrs.get($key) {
                             Some(val) => {
@@ -584,23 +728,19 @@ mod tests {
         ($input:expr) => {
             let result = parse_single_region_line_for_rust($input);
              if result.is_ok() {
-                 // If it's Ok(ParsedLine::Empty), we might still want to fail for certain inputs
                  if let Ok(ParsedLine::Empty) = result {
-                      if !$input.trim().is_empty() { // An empty line or whitespace-only line is fine to be ParsedLine::Empty
+                      if !$input.trim().is_empty() { 
                         panic!("Internal parsing should have failed for '{}' but succeeded with Empty", $input);
                       }
                  } else if let Ok(ParsedLine::Comment(_)) = result {
-                     // This might be okay if the test was for a malformed shape that looks like a comment
-                     // But for tests *expecting* failure due to malformed shapes, this is an issue.
-                     if !$input.trim().starts_with('#') { // Only allow if it genuinely looks like a comment
+                     if !$input.trim().starts_with('#') { 
                         panic!("Internal parsing should have failed for '{}' but succeeded as Comment: {:?}", $input, result.unwrap());
                      }
                  }
-                 else { // Succeeded with something other than Empty or Comment when failure was expected
+                 else { 
                     panic!("Internal parsing should have failed for '{}' but succeeded with: {:?}", $input, result.unwrap());
                  }
              }
-             // This assertion might be too broad now if EmptyOrComment is a valid "non-failure" for some inputs
              assert!(result.is_err());
         };
     }
@@ -610,7 +750,7 @@ mod tests {
         assert_rust_parses_line!("# this is a comment", Comment, "this is a comment");
         assert_rust_parses_line!("   # another comment with leading space", Comment, "another comment with leading space");
         assert_rust_parses_line!("#comment_no_space_after_hash", Comment, "comment_no_space_after_hash");
-        assert_rust_parses_line!("#", Comment, ""); // Comment with nothing after
+        assert_rust_parses_line!("#", Comment, ""); 
     }
 
     #[test]
@@ -628,62 +768,62 @@ mod tests {
 
     #[test]
     fn test_rust_parse_coord_system_with_shape() {
-        assert_rust_parses_line!("fk5; circle(1,2,3)", Some(CoordSystem::Fk5), ShapeType::Circle, false, 3, 0);
-        assert_rust_parses_line!(" J2000 ; point(10,20) # text={test}", Some(CoordSystem::J2000), ShapeType::Point, false, 2, 1);
-        assert_rust_parses_line!("fk4; -circle(1,2,3)", Some(CoordSystem::Fk4), ShapeType::Circle, true, 3, 0);
+        assert_rust_parses_line!("fk5; circle(1,2,3)", Some(CoordSystem::Fk5), ShapeType::Circle, false, 3, 0, 0);
+        assert_rust_parses_line!(" J2000 ; point(10,20) # text={test}", Some(CoordSystem::J2000), ShapeType::Point, false, 2, 1, 0);
+        assert_rust_parses_line!("fk4; -circle(1,2,3)", Some(CoordSystem::Fk4), ShapeType::Circle, true, 3, 0, 0);
     }
     
     #[test]
     fn test_rust_parse_shape_only_no_coord_system() {
-         assert_rust_parses_line!("circle(100, 200, 30)", None, ShapeType::Circle, false, 3, 0);
-         assert_rust_parses_line!("-ellipse(1,2,3,4,5)", None, ShapeType::Ellipse, true, 5, 0);
+         assert_rust_parses_line!("circle(100, 200, 30)", None, ShapeType::Circle, false, 3, 0, 0);
+         assert_rust_parses_line!("-ellipse(1,2,3,4,5)", None, ShapeType::Ellipse, true, 5, 0, 0);
     }
     
     #[test]
     fn test_rust_parse_global_attributes() {
         let line = r#"global color=green dashlist=8 3 width=1 font="helvetica 10 normal" select=1 highlite=0"#;
-        assert_rust_parses_line!(line, GlobalAttrs, 6,
-            "color" => { GlobalAttributeValue::String(s) if s == "green" },
-            "dashlist" => { GlobalAttributeValue::NumberList(v) if v == &vec![8.0, 3.0] },
-            "width" => { GlobalAttributeValue::Number(n) if (n - 1.0).abs() < 1e-9 },
-            "font" => { GlobalAttributeValue::String(s) if s == "helvetica 10 normal" },
-            "select" => { GlobalAttributeValue::Flag(true) },
-            "highlite" => { GlobalAttributeValue::Flag(false) }
+        assert_rust_parses_line!(line, GlobalAttrs, 6, 0, // 6 attributes, 0 tags
+            "color" => { AttributeValue::String(s) if s == "green" },
+            "dashlist" => { AttributeValue::NumberList(v) if v == &vec![8.0, 3.0] },
+            "width" => { AttributeValue::Number(n) if (n - 1.0).abs() < 1e-9 },
+            "font" => { AttributeValue::String(s) if s == "helvetica 10 normal" },
+            "select" => { AttributeValue::Flag(true) },
+            "highlite" => { AttributeValue::Flag(false) }
         );
     }
      #[test]
     fn test_rust_parse_global_attributes_single() {
-        assert_rust_parses_line!("global color=blue", GlobalAttrs, 1, "color" => { GlobalAttributeValue::String(s) if s == "blue" });
-        assert_rust_parses_line!("global dash=1", GlobalAttrs, 1, "dash" => { GlobalAttributeValue::Flag(true) });
+        assert_rust_parses_line!("global color=blue", GlobalAttrs, 1, 0, "color" => { AttributeValue::String(s) if s == "blue" });
+        assert_rust_parses_line!("global dash=1", GlobalAttrs, 1, 0, "dash" => { AttributeValue::Flag(true) });
     }
 
 
     #[test]
     fn test_excluded_shape_with_properties() {
-        assert_rust_parses_line!("-box(1,2,3,4,5) # color=blue", None, ShapeType::Box, true, 5, 1);
+        assert_rust_parses_line!("-box(1,2,3,4,5) # color=blue", None, ShapeType::Box, true, 5, 1, 0);
     }
 
     #[test]
     fn test_excluded_shape_leading_whitespace() {
-        assert_rust_parses_line!("  - circle(1,2,3)", None, ShapeType::Circle, true, 3, 0);
+        assert_rust_parses_line!("  - circle(1,2,3)", None, ShapeType::Circle, true, 3, 0, 0);
     }
 
     #[test]
     fn test_excluded_shape_no_leading_whitespace_before_minus() {
-         assert_rust_parses_line!("-circle(10,20,5)", None, ShapeType::Circle, true, 3, 0);
+         assert_rust_parses_line!("-circle(10,20,5)", None, ShapeType::Circle, true, 3, 0, 0);
     }
 
 
     #[test]
     fn test_rust_parse_simple_circle() {
         let line = "circle(100, 200, 30)";
-        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 0);
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 0, 0);
     }
 
     #[test]
     fn test_rust_parse_polygon_valid() {
         let line = "polygon(1,2,3,4,5,6)"; // 3 pairs
-        assert_rust_parses_line!(line, None, ShapeType::Polygon, false, 6, 0);
+        assert_rust_parses_line!(line, None, ShapeType::Polygon, false, 6, 0, 0);
     }
 
     #[test]
@@ -697,19 +837,19 @@ mod tests {
     #[test]
     fn test_rust_parse_box_valid() {
         let line = "box(1,2,10,20,0)";
-        assert_rust_parses_line!(line, None, ShapeType::Box, false, 5,0);
+        assert_rust_parses_line!(line, None, ShapeType::Box, false, 5,0,0);
     }
      #[test]
     fn test_rust_parse_rotbox_valid() {
         let line = "rotbox(1,2,10,20,30)";
-        assert_rust_parses_line!(line, None, ShapeType::RotBox, false, 5,0);
+        assert_rust_parses_line!(line, None, ShapeType::RotBox, false, 5,0,0);
     }
 
 
     #[test]
     fn test_rust_parse_annulus_valid() {
         let line_3_params = "annulus(1,2,10)"; 
-        assert_rust_parses_line!(line_3_params, None, ShapeType::Annulus, false, 3, 0);
+        assert_rust_parses_line!(line_3_params, None, ShapeType::Annulus, false, 3, 0,0);
     }
 
     #[test]
@@ -722,18 +862,19 @@ mod tests {
     #[test]
     fn test_rust_parse_circle_with_whitespace() {
         let line = "  circle  ( 100.5 ,  200 , 30 )   ";
-        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 0);
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 0,0);
     }
 
     #[test]
     fn test_rust_parse_circle_with_properties() {
-        let line = "circle( 10.5, 20 , 5.0 ) # color=red width=2 tag=foo";
-        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 3);
+        let line = "circle( 10.5, 20 , 5.0 ) # color=red width=2 tag={foo}"; 
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 2, 1); 
          match parse_single_region_line_for_rust(line) {
-             Ok(ParsedLine::ShapeDecl{properties: props, ..}) => {
-                 assert_eq!(props[0], Property { key: "color".to_string(), value: "red".to_string() });
-                 assert_eq!(props[1], Property { key: "width".to_string(), value: "2".to_string() });
-                 assert_eq!(props[2], Property { key: "tag".to_string(), value: "foo".to_string() });
+             Ok(ParsedLine::ShapeDecl{properties, tags, ..}) => { 
+                 assert_eq!(properties.get("color"), Some(&AttributeValue::String("red".to_string())));
+                 assert_eq!(properties.get("width"), Some(&AttributeValue::Number(2.0)));
+                 assert_eq!(tags.len(), 1);
+                 assert_eq!(tags[0], "foo");
              },
              _ => panic!("Should have parsed successfully with shape data"),
          }
@@ -742,7 +883,7 @@ mod tests {
     #[test]
     fn test_rust_parse_ellipse() {
         let line = "ellipse(500, 500, 20.1, 10.9, 45)";
-        assert_rust_parses_line!(line, None, ShapeType::Ellipse, false, 5, 0);
+        assert_rust_parses_line!(line, None, ShapeType::Ellipse, false, 5, 0,0);
     }
 
     #[test]
@@ -760,15 +901,15 @@ mod tests {
     #[test]
     fn test_rust_unsupported_shape_name() {
         let line = "someunknownshape(1, 2, 10, 0) # property=value";
-        assert_rust_parses_line!(line, None, ShapeType::Unsupported(_), false, 4, 1);
+        assert_rust_parses_line!(line, None, ShapeType::Unsupported(_), false, 4, 1,0);
          match parse_single_region_line_for_rust(line) {
-             Ok(ParsedLine::ShapeDecl{exclude, shape_type, properties: props, ..}) => {
+             Ok(ParsedLine::ShapeDecl{exclude, shape_type, properties, ..}) => {
                  assert!(!exclude);
                  match shape_type {
                      ShapeType::Unsupported(s) => assert!(s.eq_ignore_ascii_case("someunknownshape")),
                      _ => panic!("Expected Unsupported shape type"),
                  }
-                 assert_eq!(props[0], Property { key: "property".to_string(), value: "value".to_string() });
+                 assert_eq!(properties.get("property"), Some(&AttributeValue::String("value".to_string())));
              },
              _ => panic!("Should have parsed successfully with shape data"),
          }
@@ -776,7 +917,56 @@ mod tests {
      #[test]
     fn test_rust_vector_shape_defined() {
         let line = "vector(1,2,3,4)";
-        assert_rust_parses_line!(line, None, ShapeType::Vector, false, 4,0);
+        assert_rust_parses_line!(line, None, ShapeType::Vector, false, 4,0,0);
+    }
+
+    #[test]
+    fn test_shape_property_source() {
+        let line = "circle(100,100,20) # source";
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 1, 0);
+        match parse_single_region_line_for_rust(line) {
+            Ok(ParsedLine::ShapeDecl { properties, .. }) => {
+                assert_eq!(properties.get("source"), Some(&AttributeValue::Flag(true)));
+            }
+            _ => panic!("Test failed for source property"),
+        }
+    }
+
+    #[test]
+    fn test_shape_property_background() {
+        let line = "circle(200,200,10) # background";
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 1, 0);
+        match parse_single_region_line_for_rust(line) {
+            Ok(ParsedLine::ShapeDecl { properties, .. }) => {
+                assert_eq!(properties.get("background"), Some(&AttributeValue::Flag(true)));
+            }
+            _ => panic!("Test failed for background property"),
+        }
+    }
+
+    #[test]
+    fn test_shape_property_multiple_tags() {
+        let line = "circle(100,100,20) # tag={Group 1} tag={Group 2}";
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 0, 2); // 0 regular properties, 2 tags
+        match parse_single_region_line_for_rust(line) {
+            Ok(ParsedLine::ShapeDecl { tags, .. }) => {
+                assert_eq!(tags.len(), 2);
+                assert_eq!(tags[0], "Group 1");
+                assert_eq!(tags[1], "Group 2");
+            }
+            _ => panic!("Test failed for multiple tags"),
+        }
+    }
+     #[test]
+    fn test_shape_property_text_with_curly_braces() {
+        let line = r#"circle(100,100,20) # text={This message has both a " and ' in it}"#;
+        assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 1, 0);
+        match parse_single_region_line_for_rust(line) {
+            Ok(ParsedLine::ShapeDecl { properties, .. }) => {
+                assert_eq!(properties.get("text"), Some(&AttributeValue::String(r#"This message has both a " and ' in it"#.to_string())));
+            }
+            _ => panic!("Test failed for text property with curly braces"),
+        }
     }
 
 
