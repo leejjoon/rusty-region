@@ -549,7 +549,7 @@ fn parse_comment_line<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
 }
 
 
-fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
+fn parse_line_content<'a>(input: Input<'a>, active_system: Option<&'a CoordSystem>) -> ParserResult<'a, ParsedLine> {
     preceded(
         ws, // Consume leading whitespace for the entire line content once
         terminated(
@@ -563,7 +563,7 @@ fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
                     tuple((
                         parse_coord_system_command,
                         preceded(ws, nom_char(';')),
-                        preceded(ws, |i| parse_shape_and_props(i, None)) // Temporarily pass None, cs will be added in map
+                        preceded(ws, |i| parse_shape_and_props(i, active_system)) // Pass the active system for coordinate parsing
                     )),
                     |(cs, _, (exclude, st, coords, props, tags))| ParsedLine::ShapeDecl {
                         coord_system: Some(cs), // Use the cs parsed in this branch
@@ -580,9 +580,9 @@ fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
                     terminated(parse_coord_system_command, ws),
                     ParsedLine::CoordSysDecl
                 ),
-                // 5. SHAPE_DEFINITION (alone on a line) - No preceding CS
+                // 5. SHAPE_DEFINITION (alone on a line) - Use the active coordinate system
                 map(
-                    |i| parse_shape_and_props(i, None), // Pass None for active_system
+                    |i| parse_shape_and_props(i, active_system), // Pass the active system for coordinate parsing
                     |(exclude, st, coords, props, tags)| ParsedLine::ShapeDecl {
                         coord_system: None,
                         exclude,
@@ -602,13 +602,25 @@ fn parse_line_content<'a>(input: Input<'a>) -> ParserResult<'a, ParsedLine> {
 
 
 // --- Main Parsing Function (for Rust usage, returns Result) ---
-pub fn parse_single_region_line_for_rust(line: &str) -> Result<ParsedLine, String> { 
-    match terminated(parse_line_content, eof)(line).finish() { 
-        Ok((_remaining, output)) => {
+pub fn parse_single_region_line_for_rust(line: &str, active_system: Option<&CoordSystem>) -> Result<(ParsedLine, Option<CoordSystem>), String> { 
+    match terminated(|i| parse_line_content(i, active_system), eof)(line).finish() {
+        Ok((_, output)) => {
+            // Extra validation to catch edge cases
             if matches!(output, ParsedLine::Empty) && !line.trim().is_empty() && !line.trim().starts_with('#') {
                 return Err(format!("Line parsed as Empty but was not truly empty or comment: '{}'", line));
             }
-            Ok(output)
+            
+            // Update the active coordinate system if this line declares one
+            let new_active_system = match &output {
+                ParsedLine::CoordSysDecl(cs) => Some(cs.clone()),
+                ParsedLine::ShapeDecl { coord_system, .. } => coord_system.clone(),
+                _ => None,
+            };
+            
+            // Return the parsed line and the potentially updated coordinate system
+            // If this line doesn't specify a coordinate system, keep the existing one
+            let final_system = new_active_system.or_else(|| active_system.cloned());
+            Ok((output, final_system))
         },
         Err(e) => Err(nom::error::convert_error(line, e)),
     }
@@ -616,12 +628,19 @@ pub fn parse_single_region_line_for_rust(line: &str) -> Result<ParsedLine, Strin
 
 // --- Python Function ---
 #[pyfunction]
-fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> { 
-    match parse_single_region_line_for_rust(line) {
-        Ok(parsed_line) => {
+fn parse_region_line(py: Python<'_>, line: &str, active_system_str: Option<&str>) -> PyResult<PyObject> { 
+    // Convert the Python active_system_str to a Rust CoordSystem if provided
+    let active_system = active_system_str.map(|s| CoordSystem::from_str(s));
+    
+    match parse_single_region_line_for_rust(line, active_system.as_ref()) {
+        Ok((parsed_line, new_active_system)) => {
+            // Convert the new active system to a Python string if it exists
+            let py_new_active_system = new_active_system.map(|cs| cs.to_string_py()).into_py(py);
+            
             match parsed_line {
                 ParsedLine::CoordSysDecl(cs) => {
-                    let result_elements: [PyObject; 4] = [cs.to_string_py().into_py(py), py.None(), py.None(), py.None()];
+                    // For CoordSysDecl, the new active system is always the declared system
+                    let result_elements: [PyObject; 5] = [cs.to_string_py().into_py(py), py.None(), py.None(), py.None(), py_new_active_system];
                     Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
                 }
                 ParsedLine::ShapeDecl{ coord_system, exclude, shape_type, coordinates, properties, tags } => {
@@ -647,7 +666,7 @@ fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> {
                     )?;
                     let py_shape = Py::new(py, shape_obj)?;
 
-                    let result_elements: [PyObject; 4] = [py_coord_system, py_shape.into_py(py), py.None(), py.None()];
+                    let result_elements: [PyObject; 5] = [py_coord_system, py_shape.into_py(py), py.None(), py.None(), py_new_active_system];
                     Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
                 }
                 ParsedLine::GlobalAttributes{attributes, tags} => {
@@ -664,15 +683,15 @@ fn parse_region_line(py: Python<'_>, line: &str) -> PyResult<PyObject> {
                     if !tags.is_empty() {
                         py_attrs.set_item("tags", tags.into_py(py))?;
                     }
-                    let result_elements: [PyObject; 4] = [py.None(), py.None(), py_attrs.into_py(py), py.None()];
+                    let result_elements: [PyObject; 5] = [py.None(), py.None(), py_attrs.into_py(py), py.None(), py_new_active_system];
                     Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
                 }
                 ParsedLine::Comment(comment_text) => {
-                    let result_elements: [PyObject; 4] = [py.None(), py.None(), py.None(), comment_text.into_py(py)];
+                    let result_elements: [PyObject; 5] = [py.None(), py.None(), py.None(), comment_text.into_py(py), py_new_active_system];
                     Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
                 }
                 ParsedLine::Empty => {
-                    let result_elements: [PyObject; 4] = [py.None(), py.None(), py.None(), py.None()];
+                    let result_elements: [PyObject; 5] = [py.None(), py.None(), py.None(), py.None(), py_new_active_system];
                      Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
                 }
             }
@@ -695,71 +714,61 @@ fn rusty_region_parser(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
 mod tests {
     use super::*;
 
-     macro_rules! assert_rust_parses_line {
+    macro_rules! assert_rust_parses_line {
         // For ShapeDecl
-        ($input:expr, $expected_cs:expr, $expected_shape_type:pat, $expected_exclude:expr, $expected_coords_len:expr, $expected_props_len:expr, $expected_tags_len:expr) => {
-            match parse_single_region_line_for_rust($input) {
-                Ok(ParsedLine::ShapeDecl{coord_system, exclude, shape_type, coordinates, properties, tags}) => {
-                    assert_eq!(coord_system, $expected_cs, "CoordSystem mismatch for '{}'", $input);
-                    assert_eq!(exclude, $expected_exclude, "Exclusion flag mismatch for '{}'", $input);
-                    assert!(matches!(shape_type, $expected_shape_type), "Shape type mismatch for '{}'. Got: {:?}", $input, shape_type);
-                    assert_eq!(coordinates.len(), $expected_coords_len, "Coordinate count mismatch for '{}'. Got: {:?}, expected {}", $input, coordinates, $expected_coords_len);
-                    assert_eq!(properties.len(), $expected_props_len, "Property count mismatch for '{}'. Got: {:?}, expected {}", $input, properties.keys(), $expected_props_len); 
-                    assert_eq!(tags.len(), $expected_tags_len, "Tag count mismatch for '{}'. Got: {:?}, expected {}", $input, tags, $expected_tags_len);
-                },
-                Ok(other) => panic!("Expected ShapeDecl, got {:?} for '{}'", other, $input),
-                Err(e_str) => panic!("Internal parsing failed for '{}':\n{}", $input, e_str),
+        ($input:expr, $cs:expr, $st:expr, $excl:expr, $num_coords:expr, $num_props:expr, $num_tags:expr) => {
+            let result = parse_single_region_line_for_rust($input, None);
+            assert!(result.is_ok(), "Internal parsing failed for '{}': {:?}", $input, result.err());
+            if let Ok((ParsedLine::ShapeDecl{coord_system, exclude, shape_type, coordinates, properties, tags}, _)) = result {
+                assert_eq!(coord_system, $cs, "Coord system mismatch for '{}'", $input);
+                assert_eq!(shape_type, $st, "Shape type mismatch for '{}'", $input);
+                assert_eq!(exclude, $excl, "Exclude flag mismatch for '{}'", $input);
+                assert_eq!(coordinates.len(), $num_coords, "Coordinate count mismatch for '{}'", $input);
+                assert_eq!(properties.len(), $num_props, "Properties count mismatch for '{}'", $input);
+                assert_eq!(tags.len(), $num_tags, "Tags count mismatch for '{}'", $input);
+            } else {
+                panic!("Expected ShapeDecl for '{}', got {:?}", $input, result.unwrap());
             }
         };
-        // For CoordSysDecl
-        ($input:expr, $expected_cs:expr, CoordSysOnly) => {
-             match parse_single_region_line_for_rust($input) {
-                Ok(ParsedLine::CoordSysDecl(cs)) => {
-                    assert_eq!(Some(cs), $expected_cs, "CoordSystem mismatch for '{}'", $input);
-                },
-                Ok(other) => panic!("Expected CoordSysDecl, got {:?} for '{}'", other, $input),
-                Err(e_str) => panic!("Internal parsing failed for '{}':\n{}", $input, e_str),
-            }
-        };
-         // For GlobalAttributes
-        ($input:expr, GlobalAttrs, $expected_attr_count:expr, $expected_tags_len:expr $(, $key:expr => { $($val_pat_tokens:tt)+ } )* ) => { 
-            match parse_single_region_line_for_rust($input) {
-                Ok(ParsedLine::GlobalAttributes{attributes: attrs, tags}) => {
-                    assert_eq!(attrs.len(), $expected_attr_count, "Global attribute count mismatch for '{}'", $input);
-                    assert_eq!(tags.len(), $expected_tags_len, "Global tags count mismatch for '{}'", $input);
-                    $(
-                        match attrs.get($key) {
-                            Some(val) => {
-                                let (value_matches, actual_value_for_panic) = match val {
-                                    $($val_pat_tokens)+ => (true, format!("{:?}", val)),
-                                    _ => (false, format!("{:?}", val)),
-                                };
-                                assert!(value_matches, "Attribute '{}' value mismatch. Got: {}", $key, actual_value_for_panic);
-                            }
-                            None => panic!("Expected global attribute '{}' not found for '{}'", $key, $input),
-                        }
-                    )*
-                },
-                Ok(other) => panic!("Expected GlobalAttributes, got {:?} for '{}'", other, $input),
-                Err(e_str) => panic!("Internal parsing failed for '{}':\n{}", $input, e_str),
+        // For CoordSysOnly
+        ($input:expr, $cs:expr, CoordSysOnly) => {
+            let result = parse_single_region_line_for_rust($input, None);
+            assert!(result.is_ok(), "Internal parsing failed for '{}': {:?}", $input, result.err());
+            if let Ok((ParsedLine::CoordSysDecl(cs), _)) = result {
+                assert_eq!(cs, $cs, "Coord system mismatch for '{}'", $input);
+            } else {
+                panic!("Expected CoordSysDecl for '{}', got {:?}", $input, result.unwrap());
             }
         };
         // For Comment
         ($input:expr, Comment, $expected_comment:expr) => {
-            match parse_single_region_line_for_rust($input) {
-                Ok(ParsedLine::Comment(comment_text)) => {
-                    assert_eq!(comment_text, $expected_comment, "Comment text mismatch for '{}'", $input);
-                },
-                Ok(other) => panic!("Expected Comment, got {:?} for '{}'", other, $input),
-                Err(e_str) => panic!("Internal parsing failed for '{}':\n{}", $input, e_str),
+            let result = parse_single_region_line_for_rust($input, None);
+            assert!(result.is_ok(), "Internal parsing failed for '{}': {:?}", $input, result.err());
+            if let Ok((ParsedLine::Comment(comment_text), _)) = result {
+                assert_eq!(comment_text, $expected_comment, "Comment text mismatch for '{}'", $input);
+            } else {
+                panic!("Expected Comment for '{}', got {:?}", $input, result.unwrap());
+            }
+        };
+        // For GlobalAttributes
+        ($input:expr, GlobalAttrs, $num_attrs:expr, $num_tags:expr) => {
+            let result = parse_single_region_line_for_rust($input, None);
+            assert!(result.is_ok(), "Internal parsing failed for '{}': {:?}", $input, result.err());
+            if let Ok((ParsedLine::GlobalAttributes{attributes, tags}, _)) = result {
+                assert_eq!(attributes.len(), $num_attrs, "Global attributes count mismatch for '{}'", $input);
+                assert_eq!(tags.len(), $num_tags, "Global tags count mismatch for '{}'", $input);
+            } else {
+                panic!("Expected GlobalAttributes for '{}', got {:?}", $input, result.unwrap());
             }
         };
         // For Empty
         ($input:expr, EmptyLine) => {
-            match parse_single_region_line_for_rust($input) {
-                Ok(ParsedLine::Empty) => { /* Success */ },
-                Ok(other) => panic!("Expected Empty, got {:?} for '{}'", other, $input),
-                Err(e_str) => panic!("Internal parsing failed for '{}':\n{}", $input, e_str),
+            let result = parse_single_region_line_for_rust($input, None);
+            assert!(result.is_ok(), "Internal parsing failed for '{}': {:?}", $input, result.err());
+            if let Ok((parsed, _)) = result {
+                assert!(matches!(parsed, ParsedLine::Empty), "Expected Empty for '{}', got {:?}", $input, parsed);
+            } else {
+                panic!("Expected Empty for '{}', got error: {:?}", $input, result.err());
             }
         };
     }
@@ -767,13 +776,13 @@ mod tests {
 
      macro_rules! assert_rust_fails {
         ($input:expr) => {
-            let result = parse_single_region_line_for_rust($input);
+            let result = parse_single_region_line_for_rust($input, None);
              if result.is_ok() {
-                 if let Ok(ParsedLine::Empty) = result {
+                 if let Ok((ParsedLine::Empty, _)) = result {
                       if !$input.trim().is_empty() && !$input.trim().starts_with('#') { 
                         panic!("Internal parsing should have failed for '{}' but succeeded with Empty", $input);
                       }
-                 } else if let Ok(ParsedLine::Comment(_)) = result {
+                 } else if let Ok((ParsedLine::Comment(_), _)) = result {
                      if !$input.trim().starts_with('#') { 
                         panic!("Internal parsing should have failed for '{}' but succeeded as Comment: {:?}", $input, result.unwrap());
                      }
@@ -803,8 +812,8 @@ mod tests {
 
     #[test]
     fn test_rust_parse_coord_system_only() {
-        assert_rust_parses_line!("fk5", Some(CoordSystem::Fk5), CoordSysOnly);
-        assert_rust_parses_line!(" IMAGE ", Some(CoordSystem::Image), CoordSysOnly);
+        assert_rust_parses_line!("fk5", CoordSystem::Fk5, CoordSysOnly);
+        assert_rust_parses_line!(" IMAGE ", CoordSystem::Image, CoordSysOnly);
     }
 
     #[test]
@@ -817,7 +826,7 @@ mod tests {
     #[test]
     fn test_rust_parse_with_newline_at_end() {
         // Test coordinate system with newline
-        assert_rust_parses_line!("fk5\n", Some(CoordSystem::Fk5), CoordSysOnly);
+        assert_rust_parses_line!("fk5\n", CoordSystem::Fk5, CoordSysOnly);
         
         // Test shape with newline
         assert_rust_parses_line!("circle(100,200,30)\n", None, ShapeType::Circle, false, 3, 0, 0);
@@ -833,6 +842,46 @@ mod tests {
     }
     
     #[test]
+    fn test_active_system_propagation() {
+        // Test that the active coordinate system is properly propagated
+        
+        // First, parse a line with a coordinate system declaration
+        let result1 = parse_single_region_line_for_rust("fk5", None);
+        assert!(result1.is_ok(), "Failed to parse coordinate system declaration");
+        
+        // Extract the new active coordinate system
+        let (_, active_system) = result1.unwrap();
+        assert!(active_system.is_some(), "Active system should be Some after parsing coordinate system declaration");
+        
+        // Use as_ref() to avoid consuming the value when checking
+        if let Some(ref cs) = active_system {
+            assert_eq!(cs, &CoordSystem::Fk5, "Active system should be FK5");
+        } else {
+            panic!("Active system should not be None");
+        }
+        
+        // Now parse a shape without an explicit coordinate system, using the active system from before
+        let result2 = parse_single_region_line_for_rust("circle(10,20,30)", active_system.as_ref());
+        assert!(result2.is_ok(), "Failed to parse shape with active system");
+        
+        // The shape should be parsed with the active coordinate system
+        if let Ok((ParsedLine::ShapeDecl { coord_system, .. }, _)) = result2 {
+            assert!(coord_system.is_none(), "Shape's explicit coordinate system should be None");
+            // The active system is still propagated separately
+        } else {
+            panic!("Expected ShapeDecl");
+        }
+        
+        // Test that a new coordinate system declaration overrides the active system
+        let result3 = parse_single_region_line_for_rust("j2000", active_system.as_ref());
+        assert!(result3.is_ok(), "Failed to parse new coordinate system declaration");
+        
+        let (_, new_active_system) = result3.unwrap();
+        assert!(new_active_system.is_some(), "New active system should be Some");
+        assert_eq!(new_active_system.unwrap(), CoordSystem::J2000, "New active system should be J2000");
+    }
+    
+    #[test]
     fn test_rust_parse_shape_only_no_coord_system() {
          assert_rust_parses_line!("circle(100, 200, 30)", None, ShapeType::Circle, false, 3, 0, 0);
          assert_rust_parses_line!("-ellipse(1,2,3,4,5)", None, ShapeType::Ellipse, true, 5, 0, 0);
@@ -841,19 +890,48 @@ mod tests {
     #[test]
     fn test_rust_parse_global_attributes() {
         let line = r#"global color=green dashlist=8 3 width=1 font="helvetica 10 normal" select=1 highlite=0"#;
-        assert_rust_parses_line!(line, GlobalAttrs, 6, 0, // 6 attributes, 0 tags
-            "color" => { AttributeValue::String(s) if s == "green" },
-            "dashlist" => { AttributeValue::NumberList(v) if v == &vec![8.0, 3.0] },
-            "width" => { AttributeValue::Number(n) if (n - 1.0).abs() < 1e-9 },
-            "font" => { AttributeValue::String(s) if s == "helvetica 10 normal" },
-            "select" => { AttributeValue::Flag(true) },
-            "highlite" => { AttributeValue::Flag(false) }
-        );
+        // First, check the basic structure with the macro
+        assert_rust_parses_line!(line, GlobalAttrs, 6, 0); // 6 attributes, 0 tags
+        
+        // Then manually check the specific attribute values
+        let result = parse_single_region_line_for_rust(line, None);
+        assert!(result.is_ok());
+        if let Ok((ParsedLine::GlobalAttributes{attributes, ..}, _)) = result {
+            assert_eq!(attributes.get("color"), Some(&AttributeValue::String("green".to_string())));
+            assert_eq!(attributes.get("dashlist"), Some(&AttributeValue::NumberList(vec![8.0, 3.0])));
+            assert_eq!(attributes.get("width"), Some(&AttributeValue::Number(1.0)));
+            assert_eq!(attributes.get("font"), Some(&AttributeValue::String("helvetica 10 normal".to_string())));
+            assert_eq!(attributes.get("select"), Some(&AttributeValue::Flag(true)));
+            assert_eq!(attributes.get("highlite"), Some(&AttributeValue::Flag(false)));
+        } else {
+            panic!("Expected GlobalAttributes");
+        }
     }
      #[test]
     fn test_rust_parse_global_attributes_single() {
-        assert_rust_parses_line!("global color=blue", GlobalAttrs, 1, 0, "color" => { AttributeValue::String(s) if s == "blue" });
-        assert_rust_parses_line!("global dash=1", GlobalAttrs, 1, 0, "dash" => { AttributeValue::Flag(true) });
+        // Test color=blue
+        let line1 = "global color=blue";
+        assert_rust_parses_line!(line1, GlobalAttrs, 1, 0);
+        
+        let result1 = parse_single_region_line_for_rust(line1, None);
+        assert!(result1.is_ok());
+        if let Ok((ParsedLine::GlobalAttributes{attributes, ..}, _)) = result1 {
+            assert_eq!(attributes.get("color"), Some(&AttributeValue::String("blue".to_string())));
+        } else {
+            panic!("Expected GlobalAttributes for color=blue");
+        }
+        
+        // Test dash=1
+        let line2 = "global dash=1";
+        assert_rust_parses_line!(line2, GlobalAttrs, 1, 0);
+        
+        let result2 = parse_single_region_line_for_rust(line2, None);
+        assert!(result2.is_ok());
+        if let Ok((ParsedLine::GlobalAttributes{attributes, ..}, _)) = result2 {
+            assert_eq!(attributes.get("dash"), Some(&AttributeValue::Flag(true)));
+        } else {
+            panic!("Expected GlobalAttributes for dash=1");
+        }
     }
 
 
@@ -928,15 +1006,15 @@ mod tests {
     fn test_rust_parse_circle_with_properties() {
         let line = "circle( 10.5, 20 , 5.0 ) # color=red width=2 tag={foo}"; 
         assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 2, 1); 
-         match parse_single_region_line_for_rust(line) {
-             Ok(ParsedLine::ShapeDecl{properties, tags, ..}) => { 
-                 assert_eq!(properties.get("color"), Some(&AttributeValue::String("red".to_string())));
-                 assert_eq!(properties.get("width"), Some(&AttributeValue::Number(2.0)));
-                 assert_eq!(tags.len(), 1);
-                 assert_eq!(tags[0], "foo");
-             },
-             _ => panic!("Should have parsed successfully with shape data"),
-         }
+         match parse_single_region_line_for_rust(line, None) {
+              Ok((ParsedLine::ShapeDecl{properties, tags, ..}, _)) => { 
+                  assert_eq!(properties.get("color"), Some(&AttributeValue::String("red".to_string())));
+                  assert_eq!(properties.get("width"), Some(&AttributeValue::Number(2.0)));
+                  assert_eq!(tags.len(), 1);
+                  assert_eq!(tags[0], "foo");
+              },
+              _ => panic!("Should have parsed successfully with shape data"),
+          }
     }
 
     #[test]
@@ -960,9 +1038,19 @@ mod tests {
     #[test]
     fn test_rust_unsupported_shape_name() {
         let line = "someunknownshape(1, 2, 10, 0) # property=value";
-        assert_rust_parses_line!(line, None, ShapeType::Unsupported(_), false, 4, 1,0);
-         match parse_single_region_line_for_rust(line) {
-             Ok(ParsedLine::ShapeDecl{exclude, shape_type, properties, ..}) => {
+        // Use a more flexible approach to check the shape type
+        let result = parse_single_region_line_for_rust(line, None);
+        assert!(result.is_ok());
+        if let Ok((ParsedLine::ShapeDecl{shape_type, ..}, _)) = result {
+            match shape_type {
+                ShapeType::Unsupported(name) => assert_eq!(name, "someunknownshape"),
+                _ => panic!("Expected Unsupported shape type")
+            }
+        } else {
+            panic!("Expected ShapeDecl");
+        };
+         match parse_single_region_line_for_rust(line, None) {
+             Ok((ParsedLine::ShapeDecl{exclude, shape_type, properties, ..}, _)) => {
                  assert!(!exclude);
                  match shape_type {
                      ShapeType::Unsupported(s) => assert!(s.eq_ignore_ascii_case("someunknownshape")),
@@ -983,8 +1071,8 @@ mod tests {
     fn test_shape_property_source() {
         let line = "circle(100,100,20) # source";
         assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 1, 0);
-        match parse_single_region_line_for_rust(line) {
-            Ok(ParsedLine::ShapeDecl { properties, .. }) => {
+        match parse_single_region_line_for_rust(line, None) {
+            Ok((ParsedLine::ShapeDecl { properties, .. }, _)) => {
                 assert_eq!(properties.get("source"), Some(&AttributeValue::Flag(true)));
             }
             _ => panic!("Test failed for source property"),
@@ -995,8 +1083,8 @@ mod tests {
     fn test_shape_property_background() {
         let line = "circle(200,200,10) # background";
         assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 1, 0);
-        match parse_single_region_line_for_rust(line) {
-            Ok(ParsedLine::ShapeDecl { properties, .. }) => {
+        match parse_single_region_line_for_rust(line, None) {
+            Ok((ParsedLine::ShapeDecl { properties, .. }, _)) => {
                 assert_eq!(properties.get("background"), Some(&AttributeValue::Flag(true)));
             }
             _ => panic!("Test failed for background property"),
@@ -1007,8 +1095,8 @@ mod tests {
     fn test_shape_property_multiple_tags() {
         let line = "circle(100,100,20) # tag={Group 1} tag={Group 2}";
         assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 0, 2); // 0 regular properties, 2 tags
-        match parse_single_region_line_for_rust(line) {
-            Ok(ParsedLine::ShapeDecl { tags, .. }) => {
+        match parse_single_region_line_for_rust(line, None) {
+            Ok((ParsedLine::ShapeDecl { tags, .. }, _)) => {
                 assert_eq!(tags.len(), 2);
                 assert_eq!(tags[0], "Group 1");
                 assert_eq!(tags[1], "Group 2");
@@ -1020,8 +1108,8 @@ mod tests {
     fn test_shape_property_text_with_curly_braces() {
         let line = r#"circle(100,100,20) # text={This message has both a " and ' in it}"#;
         assert_rust_parses_line!(line, None, ShapeType::Circle, false, 3, 1, 0);
-        match parse_single_region_line_for_rust(line) {
-            Ok(ParsedLine::ShapeDecl { properties, .. }) => {
+        match parse_single_region_line_for_rust(line, None) {
+            Ok((ParsedLine::ShapeDecl { properties, .. }, _)) => {
                 assert_eq!(properties.get("text"), Some(&AttributeValue::String(r#"This message has both a " and ' in it"#.to_string())));
             }
             _ => panic!("Test failed for text property with curly braces"),

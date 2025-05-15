@@ -175,8 +175,9 @@ fn parse_angular_distance_units_format<'a>(input: Input<'a>) -> ParserResult<'a,
 pub(crate) fn parse_coord_odd<'a>(active_system: Option<&CoordSystem>, input: Input<'a>) -> ParserResult<'a, f64> {
     let scale_for_colon_ra = match active_system {
         Some(CoordSystem::Physical) | Some(CoordSystem::Image) | Some(CoordSystem::Linear) |
-        Some(CoordSystem::Detector) | Some(CoordSystem::Amplifier) | Some(CoordSystem::Unknown(_)) => 1.0,
-        _ => 15.0, // Default to celestial (hours -> degrees) for FK5, J2000, ICRS, Galactic, Ecliptic, or None
+        Some(CoordSystem::Detector) | Some(CoordSystem::Amplifier) | Some(CoordSystem::Unknown(_)) |
+        Some(CoordSystem::Galactic) => 1.0, // Use scale of 1.0 for Galactic and physical coordinate systems
+        _ => 15.0, // Default to celestial (hours -> degrees) for FK5, J2000, ICRS, Ecliptic, or None
     };
     context(
         "CoordOdd (RA-like)",
