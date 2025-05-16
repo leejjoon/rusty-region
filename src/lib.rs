@@ -7,7 +7,10 @@
 // --- PyO3 Imports ---
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyTuple, PyDict, IntoPyDict, PyList}; 
+use pyo3::types::{PyTuple, PyDict, IntoPyDict, PyList};
+use pyo3::pyclass::PyClass;
+use pyo3::pymethods;
+
 
 // --- Nom Imports ---
 use nom::{
@@ -121,26 +124,33 @@ impl Property {
     }
 }
 
-#[pyclass] #[derive(Debug, Clone)] pub struct Shape {
-    #[pyo3(get)] shape_type_str: String,
-    #[pyo3(get)] coordinates: Vec<f64>, 
-    properties_internal: HashMap<String, AttributeValue>,
-    #[pyo3(get)] tags_internal: Vec<String>, 
-    #[pyo3(get)] exclude: bool,
+#[pyclass]
+#[derive(Debug, Clone)]
+pub struct Shape {
+    pub shape_type_str: String,
+    pub coordinates: Vec<f64>, 
+    // Not exposed directly to Python
+    pub coordinate_formats: Vec<semantic_parsers::CoordFormat>,
+    pub properties_internal: HashMap<String, AttributeValue>,
+    pub tags_internal: Vec<String>, 
+    pub exclude: bool,
 }
 
 #[pymethods] 
 impl Shape { 
-    #[new] 
+    #[new]
+    #[pyo3(signature = (shape_type_str, coordinates, coordinate_formats=None, properties_py=None, tags_internal=vec![], exclude=false))]
     fn new(
         shape_type_str: String, 
         coordinates: Vec<f64>, 
-        properties_py: &Bound<'_, PyDict>, 
+        coordinate_formats: Option<Vec<semantic_parsers::CoordFormat>>, // Optional parameter for Python
+        properties_py: Option<&Bound<'_, PyDict>>, 
         tags_internal: Vec<String>, 
         exclude: bool
     ) -> PyResult<Self> { 
         let mut properties_internal_map = HashMap::new();
-        for (key_obj, value_obj) in properties_py.iter() {
+        if let Some(props) = properties_py {
+            for (key_obj, value_obj) in props.iter() {
             let key: String = key_obj.extract()?;
             let attr_value = if let Ok(s) = value_obj.extract::<String>() {
                 AttributeValue::String(s)
@@ -157,14 +167,16 @@ impl Shape {
                 return Err(PyValueError::new_err(format!("Unsupported value type for property '{}'", key)));
             };
             properties_internal_map.insert(key, attr_value);
+            }
         }
 
-        Ok(Shape { 
-            shape_type_str, 
-            coordinates, 
-            properties_internal: properties_internal_map, 
-            tags_internal, 
-            exclude 
+        Ok(Shape {
+            shape_type_str,
+            coordinates,
+            coordinate_formats: coordinate_formats.unwrap_or_default(), 
+            properties_internal: properties_internal_map,
+            tags_internal,
+            exclude,
         }) 
     }
 
@@ -297,29 +309,34 @@ fn parse_global_line<'a>(input: Input<'a>) -> ParserResult<'a, (HashMap<String, 
 
 // --- Component Parsers (for shapes) ---
 fn comma_sep<'a>(input: Input<'a>) -> ParserResult<'a, ()> { value((), tuple((ws, nom_char(','), ws)))(input)}
-fn parse_semantic_sequence<'a>(param_types: &'static [SemanticCoordType], active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> + 'a { 
+fn parse_semantic_sequence<'a>(param_types: &'static [SemanticCoordType], active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, (Vec<f64>, Vec<semantic_parsers::CoordFormat>)> + 'a { 
     move |mut i: Input| {
         let mut coords = Vec::with_capacity(param_types.len());
-        if param_types.is_empty() { return Ok((i, coords)); }
-        let (next_i, val) = dispatch_semantic_parser(param_types[0], active_system)(i)?;
+        let mut formats = Vec::with_capacity(param_types.len());
+        if param_types.is_empty() { return Ok((i, (coords, formats))); }
+        let (next_i, (val, fmt)) = dispatch_semantic_parser(param_types[0], active_system)(i)?;
         coords.push(val);
+        formats.push(fmt);
         i = next_i;
         for &semantic_type in param_types.iter().skip(1) {
             let (next_i_comma, _) = comma_sep(i)?;
-            let (next_i_val, val) = dispatch_semantic_parser(semantic_type, active_system)(next_i_comma)?;
+            let (next_i_val, (val, fmt)) = dispatch_semantic_parser(semantic_type, active_system)(next_i_comma)?;
             coords.push(val);
+            formats.push(fmt);
             i = next_i_val;
         }
-        Ok((i, coords))
+        Ok((i, (coords, formats)))
     }
 }
-fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature, active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, Vec<f64>> + 'a { 
+fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature, active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, (Vec<f64>, Vec<semantic_parsers::CoordFormat>)> + 'a { 
     move |mut i: Input| {
         let mut all_coords = Vec::new();
+        let mut all_formats = Vec::new();
         let original_input_for_error_reporting = i; 
         if !signature.fixed_head.is_empty() {
-            let (next_i, head_coords) = parse_semantic_sequence(signature.fixed_head, active_system)(i)?;
+            let (next_i, (head_coords, head_formats)) = parse_semantic_sequence(signature.fixed_head, active_system)(i)?;
             all_coords.extend(head_coords);
+            all_formats.extend(head_formats);
             i = next_i;
         }
         let mut actual_repeats = 0;
@@ -327,15 +344,21 @@ fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature, active
             if !repeat_unit_def.is_empty() {
                 for _ in 0..signature.min_repeats {
                     if !all_coords.is_empty() { let (next_i, _) = comma_sep(i)?; i = next_i; }
-                    let (next_i, unit_coords) = parse_semantic_sequence(repeat_unit_def, active_system)(i)?;
-                    all_coords.extend(unit_coords); i = next_i; actual_repeats += 1;
+                    let (next_i, (unit_coords, unit_formats)) = parse_semantic_sequence(repeat_unit_def, active_system)(i)?;
+                    all_coords.extend(unit_coords);
+                    all_formats.extend(unit_formats);
+                    i = next_i; actual_repeats += 1;
                 }
                 let max_additional_repeats = signature.max_repeats.map_or(usize::MAX, |max_r| if max_r >= signature.min_repeats { max_r - signature.min_repeats } else { 0 });
                 for _ in 0..max_additional_repeats {
                     let mut temp_i = i;
                     if !all_coords.is_empty() { match comma_sep(temp_i) { Ok((next_i, _)) => temp_i = next_i, Err(_) => break, } }
                     match parse_semantic_sequence(repeat_unit_def, active_system)(temp_i) {
-                        Ok((next_i, unit_coords)) => { all_coords.extend(unit_coords); i = next_i; actual_repeats += 1; }
+                        Ok((next_i, (unit_coords, unit_formats))) => { 
+                            all_coords.extend(unit_coords); 
+                            all_formats.extend(unit_formats);
+                            i = next_i; actual_repeats += 1; 
+                        }
                         Err(_) => break, 
                     }
                 }
@@ -347,14 +370,16 @@ fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature, active
         }
         if !signature.fixed_tail.is_empty() {
             if !all_coords.is_empty() { let (next_i, _) = comma_sep(i)?; i = next_i; }
-            let (next_i, tail_coords) = parse_semantic_sequence(signature.fixed_tail, active_system)(i)?;
-            all_coords.extend(tail_coords); i = next_i;
+            let (next_i, (tail_coords, tail_formats)) = parse_semantic_sequence(signature.fixed_tail, active_system)(i)?;
+            all_coords.extend(tail_coords);
+            all_formats.extend(tail_formats);
+            i = next_i;
         }
         if all_coords.is_empty() && signature.fixed_head.is_empty() && signature.fixed_tail.is_empty() && signature.min_repeats == 0 {} 
         else if all_coords.is_empty() && ( !signature.fixed_head.is_empty() || !signature.fixed_tail.is_empty() || signature.min_repeats > 0) {
             return Err(nom::Err::Failure(<NomVerboseError as ContextError<Input<'a>>>::add_context(original_input_for_error_reporting, "expected coordinates but found none", <NomVerboseError as NomParseErrorTrait<Input>>::from_error_kind(original_input_for_error_reporting, nom::error::ErrorKind::Eof))));
         }
-        Ok((i, all_coords))
+        Ok((i, (all_coords, all_formats)))
     }
 }
 
@@ -405,109 +430,121 @@ fn get_shape_signature(shape_name_lc: &str) -> Option<&'static ShapeSignature> {
 
 // --- Shape Parser (Rust internal result) ---
 // This function parses the shape part: `[-]shape_keyword(coords) # properties`
-// Returns (is_excluded, ShapeType enum, Vec<f64>, HashMap<String, AttributeValue>, Vec<String> for tags)
+// Returns (is_excluded, ShapeType enum, Vec<f64>, Vec<CoordFormat>, HashMap<String, AttributeValue>, Vec<String> for tags)
 fn parse_shape_and_props<'a>(
     input: Input<'a>, 
     active_system: Option<&'a CoordSystem> 
-) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, HashMap<String, AttributeValue>, Vec<String>)> {
+) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, Vec<semantic_parsers::CoordFormat>, HashMap<String, AttributeValue>, Vec<String>)> {
+    // Parse exclusion character if present
     let (i, opt_exclusion_char) = opt(nom_char('-'))(input)?;
     let exclude = opt_exclusion_char.is_some();
-    let (i, _) = ws(i)?; 
     
-    let (i_after_keyword, shape_keyword) = parse_identifier_str_no_leading_ws(i)?;
-
-    let (i_final, (coords_from_cut, (props_map_from_cut, tags_from_cut))) = cut( 
-        |inner_input: Input<'a>| {
-            let shape_keyword_lc_captured = shape_keyword.to_lowercase(); 
-            let shape_type_enum_captured = match shape_keyword_lc_captured.as_str() {
-                "circle" => ShapeType::Circle, "ellipse" => ShapeType::Ellipse,
-                "box" => ShapeType::Box, "rotbox" => ShapeType::RotBox,
-                "polygon" => ShapeType::Polygon, "point" => ShapeType::Point,
-                "line" => ShapeType::Line, "annulus" => ShapeType::Annulus,
-                "pie" => ShapeType::Pie, "panda" => ShapeType::Panda,
-                "epanda" => ShapeType::Epanda, "bpanda" => ShapeType::Bpanda,
-                "vector" => ShapeType::Vector, "text" => ShapeType::Text,
-                "ruler" => ShapeType::Ruler,
-                _ => ShapeType::Unsupported(shape_keyword.to_string()),
-            };
-
-            let (i_after_coords_parsing, coords_vec) = if let ShapeType::Unsupported(_) = shape_type_enum_captured {
-                preceded(context("opening parenthesis for unsupported shape", tuple((ws, nom_char('(')))), terminated(nom::multi::separated_list1(context("coordinate separator comma", tuple((ws, nom_char(','), ws))), context("f64 for unsupported", preceded(ws, terminated(double, ws)))), context("closing parenthesis for unsupported shape", tuple((ws, nom_char(')'))))))(inner_input)?
-            } else if let Some(signature) = get_shape_signature(&shape_keyword_lc_captured) {
-                preceded(context("opening parenthesis", tuple((ws, nom_char('(')))), terminated(parse_coordinates_by_signature(signature, active_system), context("closing parenthesis", tuple((ws, nom_char(')'))))))(inner_input)?
-            } else {
-                 let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(inner_input, nom::error::ErrorKind::Verify);
-                 let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(inner_input, "internal signature missing for known shape (inside cut)", base_err);
-                 return Err(nom::Err::Failure(ctx_err)); 
-            };
-            
-            let (i_after_props, (props_hashmap, tags_vec)) = parse_optional_shape_properties_and_tags(i_after_coords_parsing)?;
-            
-            // No need to explicitly consume trailing whitespace here as it will be handled by the outer parser
-            
-            if let ShapeType::Unsupported(_) = shape_type_enum_captured {
-            } else if let Some(signature) = get_shape_signature(&shape_keyword_lc_captured) {
-                let n_coords = coords_vec.len();
-                let len_fixed_head = signature.fixed_head.len();
-                let len_fixed_tail = signature.fixed_tail.len();
-                let min_required_for_fixed = len_fixed_head + len_fixed_tail;
-
-                if n_coords < min_required_for_fixed {
-                    let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(inner_input, nom::error::ErrorKind::Verify); 
-                    let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(inner_input, "coordinate count validation (fixed parts)", base_err);
-                    return Err(nom::Err::Failure(ctx_err)); 
+    // Consume any whitespace after the exclusion character
+    let (i, _) = ws(i)?;
+    
+    // Parse the shape keyword (e.g., "circle", "box", etc.)
+    let (i, shape_keyword) = parse_identifier_str_no_leading_ws(i)?;
+    let shape_keyword_lc = shape_keyword.to_lowercase();
+    
+    // Determine the shape type from the keyword
+    let shape_type = match shape_keyword_lc.as_str() {
+        "circle" => ShapeType::Circle,
+        "ellipse" => ShapeType::Ellipse,
+        "box" => ShapeType::Box,
+        "rotbox" => ShapeType::RotBox,
+        "polygon" => ShapeType::Polygon,
+        "point" => ShapeType::Point,
+        "line" => ShapeType::Line,
+        "annulus" => ShapeType::Annulus,
+        "pie" => ShapeType::Pie,
+        "panda" => ShapeType::Panda,
+        "epanda" => ShapeType::Epanda,
+        "bpanda" => ShapeType::Bpanda,
+        "vector" => ShapeType::Vector,
+        "text" => ShapeType::Text,
+        "ruler" => ShapeType::Ruler,
+        _ => ShapeType::Unsupported(shape_keyword.to_string()),
+    };
+    
+    // Parse the coordinates based on the shape type
+    let (i, (coords, formats)) = if let ShapeType::Unsupported(_) = shape_type {
+        // For unsupported shapes, parse a simple list of coordinates
+        let (i, coords) = preceded(
+            tuple((ws, nom_char('('))),
+            terminated(
+                separated_list1(
+                    tuple((ws, nom_char(','), ws)),
+                    preceded(ws, terminated(double, ws))
+                ),
+                tuple((ws, nom_char(')')))
+            )
+        )(i)?;
+        
+        // Create default formats for unsupported shapes (all Simple)
+        let formats = coords.iter().map(|_| 
+            semantic_parsers::CoordFormat::Angle { format: semantic_parsers::FormatAngle::Simple }
+        ).collect();
+        
+        (i, (coords, formats))
+    } else if let Some(signature) = get_shape_signature(&shape_keyword_lc) {
+        // For known shapes, use the signature to parse coordinates
+        let (i, result) = preceded(
+            tuple((ws, nom_char('('))),
+            terminated(
+                parse_coordinates_by_signature(signature, active_system),
+                tuple((ws, nom_char(')')))
+            )
+        )(i)?;
+        
+        // Validate the number of coordinates
+        let (coords, formats) = result;
+        let n_coords = coords.len();
+        let min_required = signature.fixed_head.len() + signature.fixed_tail.len();
+        
+        if n_coords < min_required {
+            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(i, nom::error::ErrorKind::Verify);
+            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(i, "Not enough coordinates for shape", base_err);
+            return Err(nom::Err::Failure(ctx_err));
+        }
+        
+        // Validate repeating units if applicable
+        if let Some(repeat_unit) = signature.repeat_unit {
+            let repeat_unit_len = repeat_unit.len();
+            if repeat_unit_len > 0 {
+                let remaining_coords = n_coords - min_required;
+                if remaining_coords % repeat_unit_len != 0 {
+                    let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(i, nom::error::ErrorKind::Verify);
+                    let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(i, "Invalid number of coordinates for shape", base_err);
+                    return Err(nom::Err::Failure(ctx_err));
                 }
-                if let Some(repeat_unit_slice) = signature.repeat_unit {
-                    let len_repeat_unit = repeat_unit_slice.len();
-                    if len_repeat_unit == 0 {
-                        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(inner_input, nom::error::ErrorKind::Verify);
-                        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(inner_input, "coordinate count validation (invalid signature: repeat unit empty)", base_err);
-                        return Err(nom::Err::Failure(ctx_err));
-                    }
-                    let n_repeating_coords = n_coords - min_required_for_fixed;
-                    if n_repeating_coords < signature.min_repeats * len_repeat_unit {
-                        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(inner_input, nom::error::ErrorKind::Verify);
-                        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(inner_input, "coordinate count validation (min repeats)", base_err);
-                        return Err(nom::Err::Failure(ctx_err));
-                    }
-                    if n_repeating_coords % len_repeat_unit != 0 {
-                        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(inner_input, nom::error::ErrorKind::Verify);
-                        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(inner_input, "coordinate count validation (repeat alignment)", base_err);
-                        return Err(nom::Err::Failure(ctx_err));
-                    }
-                    let num_repeats = n_repeating_coords / len_repeat_unit;
-                    if let Some(max_r) = signature.max_repeats {
-                        if num_repeats > max_r {
-                            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(inner_input, nom::error::ErrorKind::Verify);
-                            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(inner_input, "coordinate count validation (max repeats)", base_err);
-                            return Err(nom::Err::Failure(ctx_err));
-                        }
-                    }
-                } else { 
-                    if n_coords != min_required_for_fixed {
-                        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(inner_input, nom::error::ErrorKind::Verify);
-                        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(inner_input, "coordinate count validation (exact fixed)", base_err);
+                
+                let num_repeats = remaining_coords / repeat_unit_len;
+                if let Some(max_r) = signature.max_repeats {
+                    if num_repeats > max_r {
+                        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(i, nom::error::ErrorKind::Verify);
+                        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(i, "Too many repeats for shape", base_err);
                         return Err(nom::Err::Failure(ctx_err));
                     }
                 }
             }
-            Ok((i_after_props, (coords_vec, (props_hashmap, tags_vec)))) 
+        } else if n_coords != min_required {
+            let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(i, nom::error::ErrorKind::Verify);
+            let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(i, "Exact number of coordinates required for shape", base_err);
+            return Err(nom::Err::Failure(ctx_err));
         }
-    )(i_after_keyword)?; 
-
-    let shape_type_enum_final = match shape_keyword.to_lowercase().as_str() {
-        "circle" => ShapeType::Circle, "ellipse" => ShapeType::Ellipse,
-        "box" => ShapeType::Box, "rotbox" => ShapeType::RotBox,
-        "polygon" => ShapeType::Polygon, "point" => ShapeType::Point,
-        "line" => ShapeType::Line, "annulus" => ShapeType::Annulus,
-        "pie" => ShapeType::Pie, "panda" => ShapeType::Panda,
-        "epanda" => ShapeType::Epanda, "bpanda" => ShapeType::Bpanda,
-        "vector" => ShapeType::Vector, "text" => ShapeType::Text,
-        "ruler" => ShapeType::Ruler,
-        _ => ShapeType::Unsupported(shape_keyword.to_string()),
+        
+        (i, (coords, formats))
+    } else {
+        // This should never happen if shape_type is properly set
+        let base_err = <NomVerboseError<'a> as NomParseErrorTrait<Input<'a>>>::from_error_kind(i, nom::error::ErrorKind::Verify);
+        let ctx_err = <NomVerboseError<'a> as nom::error::ContextError<Input<'a>>>::add_context(i, "Internal error: signature missing for known shape", base_err);
+        return Err(nom::Err::Failure(ctx_err));
     };
-
-    Ok((i_final, (exclude, shape_type_enum_final, coords_from_cut, props_map_from_cut, tags_from_cut))) 
+    
+    // Parse optional properties and tags
+    let (i, (properties, tags)) = parse_optional_shape_properties_and_tags(i)?;
+    
+    Ok((i, (exclude, shape_type, coords, formats, properties, tags))) 
 }
 
 
@@ -521,6 +558,7 @@ pub enum ParsedLine {
         exclude: bool,
         shape_type: ShapeType,
         coordinates: Vec<f64>,
+        coordinate_formats: Vec<semantic_parsers::CoordFormat>, // Not exposed directly to Python
         properties: HashMap<String, AttributeValue>, 
         tags: Vec<String>,
     },
@@ -565,11 +603,12 @@ fn parse_line_content<'a>(input: Input<'a>, active_system: Option<&'a CoordSyste
                         preceded(ws, nom_char(';')),
                         preceded(ws, |i| parse_shape_and_props(i, active_system)) // Pass the active system for coordinate parsing
                     )),
-                    |(cs, _, (exclude, st, coords, props, tags))| ParsedLine::ShapeDecl {
+                    |(cs, _, (exclude, st, coords, formats, props, tags))| ParsedLine::ShapeDecl {
                         coord_system: Some(cs), // Use the cs parsed in this branch
                         exclude,
                         shape_type: st,
                         coordinates: coords,
+                        coordinate_formats: formats, // Include format information
                         properties: props,
                         tags,
                     }
@@ -583,11 +622,12 @@ fn parse_line_content<'a>(input: Input<'a>, active_system: Option<&'a CoordSyste
                 // 5. SHAPE_DEFINITION (alone on a line) - Use the active coordinate system
                 map(
                     |i| parse_shape_and_props(i, active_system), // Pass the active system for coordinate parsing
-                    |(exclude, st, coords, props, tags)| ParsedLine::ShapeDecl {
+                    |(exclude, st, coords, formats, props, tags)| ParsedLine::ShapeDecl {
                         coord_system: None,
                         exclude,
                         shape_type: st,
                         coordinates: coords,
+                        coordinate_formats: formats, // Include format information
                         properties: props,
                         tags,
                     }
@@ -643,7 +683,7 @@ fn parse_region_line(py: Python<'_>, line: &str, active_system_str: Option<&str>
                     let result_elements: [PyObject; 5] = [cs.to_string_py().into_py(py), py.None(), py.None(), py.None(), py_new_active_system];
                     Ok(PyTuple::new_bound(py, &result_elements).into_py(py))
                 }
-                ParsedLine::ShapeDecl{ coord_system, exclude, shape_type, coordinates, properties, tags } => {
+                ParsedLine::ShapeDecl{ coord_system, exclude, shape_type, coordinates, coordinate_formats, properties, tags } => {
                     let py_coord_system = coord_system.map(|cs| cs.to_string_py()).into_py(py);
                                         
                     let py_props_dict = PyDict::new_bound(py);
@@ -660,7 +700,8 @@ fn parse_region_line(py: Python<'_>, line: &str, active_system_str: Option<&str>
                     let shape_obj = Shape::new(
                         shape_type.to_string_py(),
                         coordinates,
-                        &py_props_dict, 
+                        Some(coordinate_formats), // Include the format information
+                        Some(&py_props_dict), 
                         tags,
                         exclude,
                     )?;
@@ -705,7 +746,15 @@ fn parse_region_line(py: Python<'_>, line: &str, active_system_str: Option<&str>
 fn rusty_region_parser(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_region_line, m)?)?;
     m.add_class::<Shape>()?;
-    m.add_class::<Property>()?; 
+    m.add_class::<Property>()?;
+    
+    // Add the coordinate format classes
+    m.add_class::<semantic_parsers::FormatCoordOdd>()?;
+    m.add_class::<semantic_parsers::FormatCoordEven>()?;
+    m.add_class::<semantic_parsers::FormatDistance>()?;
+    m.add_class::<semantic_parsers::FormatAngle>()?;
+    // CoordFormat is a union type and doesn't implement PyClass, so we only register the concrete format types
+    
     Ok(())
 }
 
@@ -719,7 +768,7 @@ mod tests {
         ($input:expr, $cs:expr, $st:expr, $excl:expr, $num_coords:expr, $num_props:expr, $num_tags:expr) => {
             let result = parse_single_region_line_for_rust($input, None);
             assert!(result.is_ok(), "Internal parsing failed for '{}': {:?}", $input, result.err());
-            if let Ok((ParsedLine::ShapeDecl{coord_system, exclude, shape_type, coordinates, properties, tags}, _)) = result {
+            if let Ok((ParsedLine::ShapeDecl{coord_system, exclude, shape_type, coordinates, coordinate_formats: _, properties, tags}, _)) = result {
                 assert_eq!(coord_system, $cs, "Coord system mismatch for '{}'", $input);
                 assert_eq!(shape_type, $st, "Shape type mismatch for '{}'", $input);
                 assert_eq!(exclude, $excl, "Exclude flag mismatch for '{}'", $input);
