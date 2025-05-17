@@ -7,10 +7,7 @@
 // --- PyO3 Imports ---
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyTuple, PyDict, IntoPyDict, PyList};
-use pyo3::pyclass::PyClass;
-use pyo3::pymethods;
-
+use pyo3::types::{PyTuple, PyDict, PyList};
 
 // --- Nom Imports ---
 use nom::{
@@ -129,8 +126,7 @@ impl Property {
 pub struct Shape {
     pub shape_type_str: String,
     pub coordinates: Vec<f64>, 
-    // Not exposed directly to Python
-    pub coordinate_formats: Vec<semantic_parsers::CoordFormat>,
+    pub coordinate_formats: Vec<u8>, // Store format as integers for Python exposure
     pub properties_internal: HashMap<String, AttributeValue>,
     pub tags_internal: Vec<String>, 
     pub exclude: bool,
@@ -138,12 +134,29 @@ pub struct Shape {
 
 #[pymethods] 
 impl Shape { 
+    // Getter methods for fields
+    fn get_shape_type_str(&self) -> String {
+        self.shape_type_str.clone()
+    }
+    
+    fn get_coordinates(&self) -> Vec<f64> {
+        self.coordinates.clone()
+    }
+    
+    fn get_coordinate_formats(&self) -> Vec<u8> {
+        self.coordinate_formats.clone()
+    }
+    
+    fn get_exclude(&self) -> bool {
+        self.exclude
+    }
+    
     #[new]
     #[pyo3(signature = (shape_type_str, coordinates, coordinate_formats=None, properties_py=None, tags_internal=vec![], exclude=false))]
     fn new(
         shape_type_str: String, 
         coordinates: Vec<f64>, 
-        coordinate_formats: Option<Vec<semantic_parsers::CoordFormat>>, // Optional parameter for Python
+        coordinate_formats: Option<Vec<u8>>, // Accept integers for Python compatibility
         properties_py: Option<&Bound<'_, PyDict>>, 
         tags_internal: Vec<String>, 
         exclude: bool
@@ -173,14 +186,13 @@ impl Shape {
         Ok(Shape {
             shape_type_str,
             coordinates,
-            coordinate_formats: coordinate_formats.unwrap_or_default(), 
+            coordinate_formats: coordinate_formats.unwrap_or_default(),
             properties_internal: properties_internal_map,
             tags_internal,
             exclude,
         }) 
     }
 
-    #[getter]
     fn properties(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new_bound(py);
         for (k, v_enum) in &self.properties_internal {
@@ -195,7 +207,6 @@ impl Shape {
         Ok(dict.into())
     }
 
-    #[getter]
     fn tags(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         Ok(PyList::new_bound(py, &self.tags_internal).into())
     }
@@ -309,26 +320,26 @@ fn parse_global_line<'a>(input: Input<'a>) -> ParserResult<'a, (HashMap<String, 
 
 // --- Component Parsers (for shapes) ---
 fn comma_sep<'a>(input: Input<'a>) -> ParserResult<'a, ()> { value((), tuple((ws, nom_char(','), ws)))(input)}
-fn parse_semantic_sequence<'a>(param_types: &'static [SemanticCoordType], active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, (Vec<f64>, Vec<semantic_parsers::CoordFormat>)> + 'a { 
+fn parse_semantic_sequence<'a>(param_types: &'static [SemanticCoordType], active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, (Vec<f64>, Vec<u8>)> + 'a { 
     move |mut i: Input| {
         let mut coords = Vec::with_capacity(param_types.len());
         let mut formats = Vec::with_capacity(param_types.len());
         if param_types.is_empty() { return Ok((i, (coords, formats))); }
         let (next_i, (val, fmt)) = dispatch_semantic_parser(param_types[0], active_system)(i)?;
         coords.push(val);
-        formats.push(fmt);
+        formats.push(fmt.to_int()); // Convert CoordFormat to integer
         i = next_i;
         for &semantic_type in param_types.iter().skip(1) {
             let (next_i_comma, _) = comma_sep(i)?;
             let (next_i_val, (val, fmt)) = dispatch_semantic_parser(semantic_type, active_system)(next_i_comma)?;
             coords.push(val);
-            formats.push(fmt);
+            formats.push(fmt.to_int()); // Convert CoordFormat to integer
             i = next_i_val;
         }
         Ok((i, (coords, formats)))
     }
 }
-fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature, active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, (Vec<f64>, Vec<semantic_parsers::CoordFormat>)> + 'a { 
+fn parse_coordinates_by_signature<'a>(signature: &'static ShapeSignature, active_system: Option<&'a CoordSystem>) -> impl FnMut(Input<'a>) -> ParserResult<'a, (Vec<f64>, Vec<u8>)> + 'a { 
     move |mut i: Input| {
         let mut all_coords = Vec::new();
         let mut all_formats = Vec::new();
@@ -434,7 +445,7 @@ fn get_shape_signature(shape_name_lc: &str) -> Option<&'static ShapeSignature> {
 fn parse_shape_and_props<'a>(
     input: Input<'a>, 
     active_system: Option<&'a CoordSystem> 
-) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, Vec<semantic_parsers::CoordFormat>, HashMap<String, AttributeValue>, Vec<String>)> {
+) -> ParserResult<'a, (bool, ShapeType, Vec<f64>, Vec<u8>, HashMap<String, AttributeValue>, Vec<String>)> {
     // Parse exclusion character if present
     let (i, opt_exclusion_char) = opt(nom_char('-'))(input)?;
     let exclude = opt_exclusion_char.is_some();
@@ -482,8 +493,8 @@ fn parse_shape_and_props<'a>(
         
         // Create default formats for unsupported shapes (all Simple)
         let formats = coords.iter().map(|_| 
-            semantic_parsers::CoordFormat::Angle { format: semantic_parsers::FormatAngle::Simple }
-        ).collect();
+            semantic_parsers::FORMAT_SIMPLE // Use the integer constant instead of enum
+        ).collect::<Vec<u8>>();
         
         (i, (coords, formats))
     } else if let Some(signature) = get_shape_signature(&shape_keyword_lc) {
@@ -558,7 +569,7 @@ pub enum ParsedLine {
         exclude: bool,
         shape_type: ShapeType,
         coordinates: Vec<f64>,
-        coordinate_formats: Vec<semantic_parsers::CoordFormat>, // Not exposed directly to Python
+        coordinate_formats: Vec<u8>, // Store format as integers
         properties: HashMap<String, AttributeValue>, 
         tags: Vec<String>,
     },
@@ -749,11 +760,12 @@ fn rusty_region_parser(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_class::<Property>()?;
     
     // Add the coordinate format classes
-    m.add_class::<semantic_parsers::FormatCoordOdd>()?;
-    m.add_class::<semantic_parsers::FormatCoordEven>()?;
-    m.add_class::<semantic_parsers::FormatDistance>()?;
-    m.add_class::<semantic_parsers::FormatAngle>()?;
-    // CoordFormat is a union type and doesn't implement PyClass, so we only register the concrete format types
+    // Export format constants to Python
+    m.add("FORMAT_SIMPLE", semantic_parsers::FORMAT_SIMPLE)?;
+    m.add("FORMAT_SEXAGESIMAL_COLON", semantic_parsers::FORMAT_SEXAGESIMAL_COLON)?;
+    m.add("FORMAT_SEXAGESIMAL_HMS", semantic_parsers::FORMAT_SEXAGESIMAL_HMS)?;
+    m.add("FORMAT_SEXAGESIMAL_DMS", semantic_parsers::FORMAT_SEXAGESIMAL_DMS)?;
+    m.add("FORMAT_WITH_UNIT", semantic_parsers::FORMAT_WITH_UNIT)?;
     
     Ok(())
 }

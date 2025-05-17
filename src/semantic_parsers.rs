@@ -17,115 +17,47 @@ use nom::{
     sequence::{delimited, pair, preceded, terminated, tuple},
 };
 use std::str::FromStr;
-// Assumes these are pub(crate) or pub in lib.rs or a shared prelude module
-// Define enums for coordinate formats
-use pyo3::prelude::*;
 
-#[pyclass]
-#[derive(Debug, Clone, PartialEq)]
-pub enum FormatCoordOdd {
-    Simple,
-    SexagesimalWithColon,
-    SexagesimalWithHMS,
-}
+// Define format types as integers for simplicity
+// This makes it easier to expose to Python without complex enum types
+pub const FORMAT_SIMPLE: u8 = 0;
+pub const FORMAT_SEXAGESIMAL_COLON: u8 = 1;
+pub const FORMAT_SEXAGESIMAL_HMS: u8 = 2;
+pub const FORMAT_SEXAGESIMAL_DMS: u8 = 3;
+pub const FORMAT_WITH_UNIT: u8 = 4;
 
-#[pymethods]
-impl FormatCoordOdd {
-    fn __str__(&self) -> String {
-        match self {
-            FormatCoordOdd::Simple => "simple".to_string(),
-            FormatCoordOdd::SexagesimalWithColon => "sexagesimal_with_colon".to_string(),
-            FormatCoordOdd::SexagesimalWithHMS => "sexagesimal_with_hms".to_string(),
-        }
-    }
-}
-
-#[pyclass]
-#[derive(Debug, Clone, PartialEq)]
-pub enum FormatCoordEven {
-    Simple,
-    SexagesimalWithColon,
-    SexagesimalWithDMS,
-}
-
-#[pymethods]
-impl FormatCoordEven {
-    fn __str__(&self) -> String {
-        match self {
-            FormatCoordEven::Simple => "simple".to_string(),
-            FormatCoordEven::SexagesimalWithColon => "sexagesimal_with_colon".to_string(),
-            FormatCoordEven::SexagesimalWithDMS => "sexagesimal_with_dms".to_string(),
-        }
-    }
-}
-
-#[pyclass]
-#[derive(Debug, Clone, PartialEq)]
-pub enum FormatDistance {
-    Simple,
-    WithUnit,
-}
-
-#[pymethods]
-impl FormatDistance {
-    fn __str__(&self) -> String {
-        match self {
-            FormatDistance::Simple => "simple".to_string(),
-            FormatDistance::WithUnit => "with_unit".to_string(),
-        }
-    }
-}
-
-#[pyclass]
-#[derive(Debug, Clone, PartialEq)]
-pub enum FormatAngle {
-    Simple,
-}
-
-#[pymethods]
-impl FormatAngle {
-    fn __str__(&self) -> String {
-        match self {
-            FormatAngle::Simple => "simple".to_string(),
-        }
-    }
-}
-
-#[pyclass]
+// Single enum for all coordinate formats
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoordFormat {
-    Odd { format: FormatCoordOdd },
-    Even { format: FormatCoordEven },
-    Distance { format: FormatDistance },
-    Angle { format: FormatAngle },
+    // Basic formats that apply to all coordinate types
+    Simple,
+    SexagesimalWithColon,
+    // Specialized formats
+    SexagesimalWithHMS,    // For RA (odd coordinates)
+    SexagesimalWithDMS,    // For Dec (even coordinates)
+    WithUnit,              // For distances
 }
 
-// No pymethods for CoordFormat as it's a union type and not directly exposed to Python
 impl CoordFormat {
-    fn __str__(&self) -> String {
+    // Convert to integer for Python exposure
+    pub fn to_int(&self) -> u8 {
         match self {
-            CoordFormat::Odd { format: fmt } => format!("odd:{}", fmt.__str__()),
-            CoordFormat::Even { format: fmt } => format!("even:{}", fmt.__str__()),
-            CoordFormat::Distance { format: fmt } => format!("distance:{}", fmt.__str__()),
-            CoordFormat::Angle { format: fmt } => format!("angle:{}", fmt.__str__()),
+            CoordFormat::Simple => FORMAT_SIMPLE,
+            CoordFormat::SexagesimalWithColon => FORMAT_SEXAGESIMAL_COLON,
+            CoordFormat::SexagesimalWithHMS => FORMAT_SEXAGESIMAL_HMS,
+            CoordFormat::SexagesimalWithDMS => FORMAT_SEXAGESIMAL_DMS,
+            CoordFormat::WithUnit => FORMAT_WITH_UNIT,
         }
     }
     
-    fn get_type(&self) -> String {
+    // For debugging and display purposes
+    pub fn to_string(&self) -> String {
         match self {
-            CoordFormat::Odd { .. } => "odd".to_string(),
-            CoordFormat::Even { .. } => "even".to_string(),
-            CoordFormat::Distance { .. } => "distance".to_string(),
-            CoordFormat::Angle { .. } => "angle".to_string(),
-        }
-    }
-    
-    fn get_format(&self) -> String {
-        match self {
-            CoordFormat::Odd { format: fmt } => fmt.__str__(),
-            CoordFormat::Even { format: fmt } => fmt.__str__(),
-            CoordFormat::Distance { format: fmt } => fmt.__str__(),
-            CoordFormat::Angle { format: fmt } => fmt.__str__(),
+            CoordFormat::Simple => "simple".to_string(),
+            CoordFormat::SexagesimalWithColon => "sexagesimal_colon".to_string(),
+            CoordFormat::SexagesimalWithHMS => "sexagesimal_hms".to_string(),
+            CoordFormat::SexagesimalWithDMS => "sexagesimal_dms".to_string(),
+            CoordFormat::WithUnit => "with_unit".to_string(),
         }
     }
 }
@@ -284,7 +216,7 @@ fn parse_angular_distance_units_format<'a>(input: Input<'a>) -> ParserResult<'a,
 
 // --- Semantic Coordinate Parsers ---
 
-pub(crate) fn parse_coord_odd<'a>(active_system: Option<&CoordSystem>, input: Input<'a>) -> ParserResult<'a, (f64, FormatCoordOdd)> {
+pub(crate) fn parse_coord_odd<'a>(active_system: Option<&CoordSystem>, input: Input<'a>) -> ParserResult<'a, (f64, CoordFormat)> {
     let scale_for_colon_ra = match active_system {
         Some(CoordSystem::Physical) | Some(CoordSystem::Image) | Some(CoordSystem::Linear) |
         Some(CoordSystem::Detector) | Some(CoordSystem::Amplifier) | Some(CoordSystem::Unknown(_)) |
@@ -298,10 +230,10 @@ pub(crate) fn parse_coord_odd<'a>(active_system: Option<&CoordSystem>, input: In
                 alt((
                     // Map each parser to return both the value and its format
                     map(parse_sexagesimal_units_format("h", 15.0, "HMS format (e.g., 10h20m30s)"), 
-                        |val| (val, FormatCoordOdd::SexagesimalWithHMS)),
+                        |val| (val, CoordFormat::SexagesimalWithHMS)),
                     map(parse_colon_sexagesimal_format(scale_for_colon_ra, "Colon-separated HMS"), 
-                        |val| (val, FormatCoordOdd::SexagesimalWithColon)),
-                    map(double, |val| (val, FormatCoordOdd::Simple)) // Simple double
+                        |val| (val, CoordFormat::SexagesimalWithColon)),
+                    map(double, |val| (val, CoordFormat::Simple)) // Simple double
                 )),
                 ws
             )
@@ -309,7 +241,7 @@ pub(crate) fn parse_coord_odd<'a>(active_system: Option<&CoordSystem>, input: In
     )(input)
 }
 
-pub(crate) fn parse_coord_even<'a>(active_system: Option<&CoordSystem>, input: Input<'a>) -> ParserResult<'a, (f64, FormatCoordEven)> {
+pub(crate) fn parse_coord_even<'a>(active_system: Option<&CoordSystem>, input: Input<'a>) -> ParserResult<'a, (f64, CoordFormat)> {
     // For Dec, colon format is generally always degrees.
     let scale_for_colon_dec = 1.0;
     context(
@@ -319,10 +251,10 @@ pub(crate) fn parse_coord_even<'a>(active_system: Option<&CoordSystem>, input: I
                 alt((
                     // Map each parser to return both the value and its format
                     map(parse_sexagesimal_units_format("d", 1.0, "DMS format (e.g., +10d20m30s)"), 
-                        |val| (val, FormatCoordEven::SexagesimalWithDMS)),
+                        |val| (val, CoordFormat::SexagesimalWithDMS)),
                     map(parse_colon_sexagesimal_format(scale_for_colon_dec, "Colon-separated DMS"), 
-                        |val| (val, FormatCoordEven::SexagesimalWithColon)),
-                    map(double, |val| (val, FormatCoordEven::Simple)) // Simple double
+                        |val| (val, CoordFormat::SexagesimalWithColon)),
+                    map(double, |val| (val, CoordFormat::Simple)) // Simple double
                 )),
                 ws
             )
@@ -330,14 +262,14 @@ pub(crate) fn parse_coord_even<'a>(active_system: Option<&CoordSystem>, input: I
     )(input)
 }
 
-pub(crate) fn parse_distance<'a>(input: Input<'a>) -> ParserResult<'a, (f64, FormatDistance)> {
+pub(crate) fn parse_distance<'a>(input: Input<'a>) -> ParserResult<'a, (f64, CoordFormat)> {
     context(
         "Distance (angular size)",
         preceded(ws,
             terminated(
                 alt((
-                    map(parse_angular_distance_units_format, |val| (val, FormatDistance::WithUnit)),
-                    map(double, |val| (val, FormatDistance::Simple))
+                    map(parse_angular_distance_units_format, |val| (val, CoordFormat::WithUnit)),
+                    map(double, |val| (val, CoordFormat::Simple))
                 )),
                 ws
             )
@@ -345,8 +277,8 @@ pub(crate) fn parse_distance<'a>(input: Input<'a>) -> ParserResult<'a, (f64, For
     )(input)
 }
 
-pub(crate) fn parse_angle<'a>(input: Input<'a>) -> ParserResult<'a, (f64, FormatAngle)> {
-    map(parse_simple_signed_f64_ws, |val| (val, FormatAngle::Simple))(input)
+pub(crate) fn parse_angle<'a>(input: Input<'a>) -> ParserResult<'a, (f64, CoordFormat)> {
+    map(parse_simple_signed_f64_ws, |val| (val, CoordFormat::Simple))(input)
 }
 
 // For integers, we don't track format information separately
@@ -363,20 +295,20 @@ pub(crate) fn dispatch_semantic_parser<'a>(
     move |i: Input<'a>| { // The input 'i' also has lifetime 'a
         match semantic_type {
             SemanticCoordType::CoordOdd => {
-                parse_coord_odd(active_system, i).map(|(i, (val, fmt))| (i, (val, CoordFormat::Odd { format: fmt })))
+                parse_coord_odd(active_system, i)
             },
             SemanticCoordType::CoordEven => {
-                parse_coord_even(active_system, i).map(|(i, (val, fmt))| (i, (val, CoordFormat::Even { format: fmt })))
+                parse_coord_even(active_system, i)
             },
             SemanticCoordType::Distance => {
-                parse_distance(i).map(|(i, (val, fmt))| (i, (val, CoordFormat::Distance { format: fmt })))
+                parse_distance(i)
             },
             SemanticCoordType::Angle => {
-                parse_angle(i).map(|(i, (val, fmt))| (i, (val, CoordFormat::Angle { format: fmt })))
+                parse_angle(i)
             },
             SemanticCoordType::Integer => {
                 // For integers, we don't track format information
-                parse_integer_as_f64(i).map(|(i, val)| (i, (val, CoordFormat::Angle { format: FormatAngle::Simple })))
+                parse_integer_as_f64(i).map(|(i, val)| (i, (val, CoordFormat::Simple)))
             },
         }
     }
