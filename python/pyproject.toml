@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "setuptools-rust>=1.5.0", "maturin>=1.0.0"]
+build-backend = "maturin"
+
+[project]
+name = "rusty_region"
+version = "0.1.0"
+description = "A Python wrapper for the Rust-based DS9 region file parser"
+readme = "README.md"
+requires-python = ">=3.6"
+license = {text = "MIT"}
+authors = [
+    {name = "Jae-Joon Lee", email = "lee.j.joon@gmail.com"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/leejjoon/rusty-region"
+"Bug Tracker" = "https://github.com/leejjoon/rusty-region/issues"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "rusty_region.rusty_region_parser"
+py-packages = ["rusty_region"]
+manifest-path = "../Cargo.toml"
+# Make sure the Python module can find the Rust extension
+python-source = "."
