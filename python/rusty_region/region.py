@@ -25,9 +25,26 @@ class FormatType(IntEnum):
 class Shape:
     """A high-level wrapper for a region shape"""
     
-    def __init__(self, rust_shape: RustShape):
-        """Initialize from a Rust Shape object"""
-        self._rust_shape = rust_shape
+    def __init__(self, rust_shape):
+        """Initialize from a Rust Shape object
+        
+        Args:
+            rust_shape: A Rust Shape object or dictionary with shape data
+        """
+        # Handle different types of input
+        if isinstance(rust_shape, dict):
+            # Create a RustShape from a dictionary
+            self._rust_shape = RustShape(
+                rust_shape.get('shape_type', ''),
+                rust_shape.get('coordinates', []),
+                rust_shape.get('coordinate_formats', None),
+                rust_shape.get('properties', {}),
+                rust_shape.get('tags', []),
+                rust_shape.get('exclude', False)
+            )
+        else:
+            # Assume it's a RustShape object
+            self._rust_shape = rust_shape
         
     @classmethod
     def create(cls, shape_type: str, coordinates: List[float], 

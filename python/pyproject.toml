@@ -29,6 +29,12 @@ dependencies = [
     "matplotlib",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov",
+]
+
 [project.urls]
 "Homepage" = "https://github.com/leejjoon/rusty-region"
 "Bug Tracker" = "https://github.com/leejjoon/rusty-region/issues"
@@ -40,3 +46,10 @@ py-packages = ["rusty_region"]
 manifest-path = "../Cargo.toml"
 # Make sure the Python module can find the Rust extension
 python-source = "."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "--cov=rusty_region --cov-report=term-missing"

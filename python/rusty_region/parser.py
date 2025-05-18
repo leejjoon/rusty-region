@@ -25,10 +25,25 @@ def parse_region_string(region_string: str) -> Region:
             continue
             
         # Parse the line using the Rust parser
-        result = rust_parse_region_line(line, active_coord_system)
-        
-        # Unpack the result tuple: (shape, coord_system, global_attrs, comment, new_active_system)
-        shape_obj, coord_system, global_attrs, comment, new_active_system = result
+        try:
+            result = rust_parse_region_line(line, active_coord_system)
+            
+            # Unpack the result tuple: (coord_system, shape_obj, global_attrs, comment, new_active_system)
+            # Note: The order is different from what we expected before
+            coord_system, shape_obj, global_attrs, comment, new_active_system = result
+            
+            # Debug output
+            print(f"Parsed line: '{line}'")
+            print(f"  coord_system: {coord_system}")
+            print(f"  shape_obj: {shape_obj}")
+            print(f"  global_attrs: {global_attrs}")
+            print(f"  comment: {comment}")
+            print(f"  new_active_system: {new_active_system}")
+            
+        except Exception as e:
+            # Skip lines that can't be parsed
+            print(f"Warning: Failed to parse line: '{line}'. Error: {e}")
+            continue
         
         # Update the active coordinate system if a new one was specified
         if new_active_system is not None:
@@ -37,12 +52,15 @@ def parse_region_string(region_string: str) -> Region:
         # Handle different types of lines
         if shape_obj is not None:
             # Create a Shape object and add it to the region
+            print(f"  Adding shape: {shape_obj}")
             region.add_shape(Shape(shape_obj))
-        elif global_attrs is not None:
+        if global_attrs is not None:
             # Update global properties
+            print(f"  Adding global attributes: {global_attrs}")
             region.update_global_properties(global_attrs)
-        elif comment is not None:
+        if comment is not None:
             # Add a comment
+            print(f"  Adding comment: {comment}")
             region.add_comment(comment)
     
     return region
